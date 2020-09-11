@@ -219,16 +219,14 @@ fn delta_compute_fields(
                 (
                     quote! {
                         let mut #add = new.#og_ident.into_iter().collect::<::std::vec::Vec<_>>();
-                        let mut in_both = ::std::vec![];
-                        let mut #remove = old.#og_ident.into_iter().filter_map(|i| {
-                            if #add.iter().any(|a| a == &i) {
-                                in_both.push(i);
+                        let #remove = old.#og_ident.into_iter().filter_map(|i| {
+                            if let Some(index) = #add.iter().position(|a| a == &i) {
+                                #add.remove(index);
                                 None
                             } else {
                                 Some(i)
                             }
                         }).collect::<::std::vec::Vec<_>>();
-                        #add.retain(|i| !in_both.iter().any(|a| a == i));
                     },
                     quote! {
                         #add,

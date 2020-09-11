@@ -47,7 +47,6 @@ mod tests {
         bar: bool,
     }
 
-
     #[derive(Delta)]
     #[delta_struct(default = "unordered")]
     struct AttributeTest {
@@ -103,13 +102,19 @@ mod tests {
 
     #[test]
     fn delta_field() {
-        let old = DeltaRecursion { foo: NewType(5), bar: false };
-        let new = DeltaRecursion { foo: NewType(6), bar: true };
+        let old = DeltaRecursion {
+            foo: NewType(5),
+            bar: false,
+        };
+        let new = DeltaRecursion {
+            foo: NewType(6),
+            bar: true,
+        };
         let delta = Delta::delta(old, new).unwrap();
         // TODO: Use assert_eq when we build out delta struct
         // attributes.
         if let Some(NewTypeDelta { field_0: Some(6) }) = delta.foo {
-           // Do nothing, this is the pass case. 
+            // Do nothing, this is the pass case.
         } else {
             panic!();
         }

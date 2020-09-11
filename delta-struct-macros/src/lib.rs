@@ -98,7 +98,8 @@ pub fn derive_delta(input: TokenStream) -> TokenStream {
           #delta_fields
       }
     };
-    let (delta_compute_let, delta_compute_fields) = delta_compute_fields(named, fields.iter().cloned());
+    let (delta_compute_let, delta_compute_fields) =
+        delta_compute_fields(named, fields.iter().cloned());
     let delta_apply_actions = delta_apply_fields(named, fields.into_iter());
     let partial_eq_types = generics
         .type_params()
@@ -243,8 +244,8 @@ fn delta_compute_fields(
                 },
             ),
             FieldType::Delta => (
-                quote!{
-                    let #ident = Delta::delta(old.#og_ident, new.#og_ident); 
+                quote! {
+                    let #ident = Delta::delta(old.#og_ident, new.#og_ident);
                     delta_is_some = delta_is_some || #ident.is_some();
 
                 },

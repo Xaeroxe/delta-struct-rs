@@ -4,6 +4,8 @@ pub trait Delta {
     type Output;
 
     fn delta(old: Self, new: Self) -> Option<Self::Output>;
+
+    fn apply_delta(&mut self, delta: Self::Output);
 }
 #[cfg(test)]
 mod tests {
@@ -12,7 +14,7 @@ mod tests {
     #[derive(Delta)]
     struct UnitType;
 
-    #[derive(Delta)]
+    #[derive(Delta, Clone, Debug, PartialEq, Eq)]
     // #[delta_struct(attributes(derive(Clone, Debug)))]
     struct NewType(i32);
 
@@ -56,8 +58,18 @@ mod tests {
         baz: Vec<i32>,
     }
 
+    #[derive(Delta, Clone, Debug, PartialEq, Eq)]
+    struct AllFieldTypes {
+        #[delta_struct(field_type = "scalar")]
+        scalar: i32,
+        #[delta_struct(field_type = "delta")]
+        delta: NewType,
+        #[delta_struct(field_type = "unordered")]
+        unordered: Vec<i32>,
+    }
+
     #[test]
-    fn it_works() {
+    fn unordered_with_scalar() {
         let old = SimpleCollectionWithGeneric {
             foo: vec![1, 2, 3],
             bar: false,
@@ -90,7 +102,7 @@ mod tests {
     }
 
     #[test]
-    fn delta_field_test() {
+    fn delta_field() {
         let old = DeltaRecursion { foo: NewType(5), bar: false };
         let new = DeltaRecursion { foo: NewType(6), bar: true };
         let delta = Delta::delta(old, new).unwrap();
@@ -121,5 +133,24 @@ mod tests {
         assert!(delta.bar.is_none());
         assert_eq!(delta.baz_add, vec![9, 4, 5]);
         assert_eq!(delta.baz_remove, vec![]);
+    }
+
+    #[test]
+    fn apply_delta_all_field_types() {
+        let old = AllFieldTypes {
+            scalar: 1,
+            delta: NewType(3),
+            unordered: vec![1, 2, 3, 3],
+        };
+        let new = AllFieldTypes {
+            scalar: 2,
+            delta: NewType(4),
+            unordered: vec![3, 4, 5],
+        };
+        let new_clone = new.clone();
+        let mut old_delta_applied = old.clone();
+        let delta = Delta::delta(old, new);
+        old_delta_applied.apply_delta(delta.unwrap());
+        assert_eq!(new_clone, old_delta_applied);
     }
 }

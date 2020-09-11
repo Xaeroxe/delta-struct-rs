@@ -15,7 +15,7 @@ mod tests {
     struct UnitType;
 
     #[derive(Delta, Clone, Debug, PartialEq, Eq)]
-    // #[delta_struct(attributes(derive(Clone, Debug)))]
+    #[delta_struct(delta_leader = "#[derive(Clone, Debug, PartialEq, Eq)]")]
     struct NewType(i32);
 
     #[derive(Delta)]
@@ -23,6 +23,7 @@ mod tests {
 
     #[derive(Delta)]
     struct SimpleType {
+        #[delta_struct(delta_leader = "/// This is foo.")]
         foo: i32,
         bar: bool,
     }
@@ -35,7 +36,10 @@ mod tests {
 
     #[derive(Delta)]
     struct SimpleCollectionWithGeneric<T> {
-        #[delta_struct(field_type = "unordered")]
+        #[delta_struct(
+            field_type = "unordered",
+            delta_leader = "/// This the foo type on the delta struct."
+        )]
         foo: Vec<T>,
         bar: bool,
     }
@@ -159,3 +163,4 @@ mod tests {
         assert_eq!(new_clone, old_delta_applied);
     }
 }
+

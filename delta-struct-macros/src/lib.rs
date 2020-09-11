@@ -30,8 +30,8 @@ pub fn derive_delta(input: TokenStream) -> TokenStream {
         mut generics,
         data,
     } = parse_macro_input!(input as DeriveInput);
-    let default_field_type = match get_fieldtype_from_attrs(attrs.into_iter(), "default") {
-        Ok(v) => v.unwrap_or(FieldType::Scalar),
+    let (default_field_type, delta_leader) = match get_fieldtype_from_attrs(attrs.into_iter(), "default") {
+        Ok((v, delta_leader)) => (v.unwrap_or(FieldType::Scalar), delta_leader),
         Err(_) => {
             abort_call_site!(
                 "delta_struct(default = ...) for {} is not an accepted value, expected {}.",
@@ -91,9 +91,11 @@ pub fn derive_delta(input: TokenStream) -> TokenStream {
             )
         }
     };
+    let delta_leader = proc_macro2::TokenStream::from_str(&delta_leader).unwrap();
     let delta_ident = format_ident!("{}Delta", ident);
     let delta_fields = delta_fields(named, fields.iter().cloned());
     let delta_struct = quote! {
+      #delta_leader
       #vis struct #delta_ident #generics {
           #delta_fields
       }
@@ -162,9 +164,10 @@ pub fn derive_delta(input: TokenStream) -> TokenStream {
 
 fn delta_fields(
     named: bool,
-    iter: impl Iterator<Item = (String, Type, FieldType)>,
+    iter: impl Iterator<Item = (String, Type, FieldType, String)>,
 ) -> proc_macro2::TokenStream {
-    ::std::iter::FromIterator::from_iter(iter.map(|(ident, ty, field_ty)| {
+    ::std::iter::FromIterator::from_iter(iter.map(|(ident, ty, field_ty, field_leader)| {
+        let field_leader = proc_macro2::TokenStream::from_str(&field_leader).unwrap();
         let ident = if named {
             format_ident!("{}", ident)
         } else {
@@ -176,17 +179,21 @@ fn delta_fields(
                 let add = format_ident!("{}_add", ident);
                 let remove = format_ident!("{}_remove", ident);
                 quote! {
+                 #field_leader
                  #add: Vec<<#ty as ::std::iter::IntoIterator>::Item>,
+                 #field_leader
                  #remove: Vec<<#ty as ::std::iter::IntoIterator>::Item>,
                 }
             }
             FieldType::Scalar => {
                 quote! {
+                  #field_leader
                   #ident: ::std::option::Option<#ty>,
                 }
             }
             FieldType::Delta => {
                 quote! {
+                    #field_leader
                     #ident: ::std::option::Option<<#ty as Delta>::Output>,
                 }
             }
@@ -196,9 +203,9 @@ fn delta_fields(
 
 fn delta_compute_fields(
     named: bool,
-    iter: impl Iterator<Item = (String, Type, FieldType)>,
+    iter: impl Iterator<Item = (String, Type, FieldType, String)>,
 ) -> (proc_macro2::TokenStream, proc_macro2::TokenStream) {
-    iter.map(|(og_ident, _ty, field_ty)| {
+    iter.map(|(og_ident, _ty, field_ty, _field_leader)| {
         let ident = if named {
             format_ident!("{}", og_ident)
         } else {
@@ -260,9 +267,9 @@ fn delta_compute_fields(
 
 fn delta_apply_fields(
     named: bool,
-    iter: impl Iterator<Item = (String, Type, FieldType)>,
+    iter: impl Iterator<Item = (String, Type, FieldType, String)>,
 ) -> proc_macro2::TokenStream {
-    let iter = iter.map(|(og_ident, ty, field_ty)| {
+    let iter = iter.map(|(og_ident, ty, field_ty, _field_leader)| {
         let ident = if named {
             format_ident!("{}", og_ident)
         } else {
@@ -308,12 +315,12 @@ fn delta_apply_fields(
 }
 
 fn collect_results(
-    iter: impl Iterator<Item = (String, Type, Result<Option<FieldType>, FieldTypeError>)>,
+    iter: impl Iterator<Item = (String, Type, Result<(Option<FieldType>, String), FieldTypeError>)>,
     default_field_type: FieldType,
-) -> Result<Vec<(String, Type, FieldType)>, Vec<String>> {
+) -> Result<Vec<(String, Type, FieldType, String)>, Vec<String>> {
     iter.fold(Ok(vec![]), |v, i| match (v, i) {
-        (Ok(mut v), (ident, b, Ok(c))) => {
-            v.push((ident, b, c.unwrap_or(default_field_type)));
+        (Ok(mut v), (ident, b, Ok((c, d)))) => {
+            v.push((ident, b, c.unwrap_or(default_field_type), d));
             Ok(v)
         }
         (Ok(_), (ident, _, Err(_))) => Err(vec![ident]),
@@ -326,14 +333,13 @@ fn collect_results(
 }
 
 enum FieldTypeError {
-    WrongNameOrTooMuch(Vec<(Option<String>, String)>),
     UnrecognizedJunkFound(Vec<NestedMeta>),
 }
 
 fn get_fieldtype_from_attrs(
     iter: impl Iterator<Item = Attribute>,
     attr_name: &str,
-) -> Result<Option<FieldType>, FieldTypeError> {
+) -> Result<(Option<FieldType>, String), FieldTypeError> {
     for attr in iter {
         if let Ok(Meta::List(MetaList { path, nested, .. })) = attr.parse_meta() {
             let Path { segments, .. } = path;
@@ -366,18 +372,29 @@ fn get_fieldtype_from_attrs(
                     });
                 return match values {
                     Ok(v) => {
-                        if v.len() == 1 && v[0].0.as_deref() == Some(attr_name) {
-                            Ok(string_to_fieldtype(&v[0].1))
-                        } else {
-                            Err(FieldTypeError::WrongNameOrTooMuch(v))
+                        let mut field_type = None;
+                        let mut delta_leader = String::new();
+                        for i in v {
+                            match i.0.as_deref() {
+                                Some("delta_leader") => {
+                                    delta_leader = i.1;
+                                },
+                                a @ _ if Some(attr_name) == a => {
+                                   field_type = string_to_fieldtype(&i.1); 
+                                },
+                                a @ _ => {
+                                    abort_call_site!("Unrecognized value {:?}", a);
+                                }
+                            }
                         }
+                        Ok((field_type, delta_leader))
                     }
                     Err(v) => Err(FieldTypeError::UnrecognizedJunkFound(v)),
                 };
             }
         }
     }
-    Ok(None)
+    Ok((None, String::new()))
 }
 
 fn string_to_fieldtype(s: &str) -> Option<FieldType> {

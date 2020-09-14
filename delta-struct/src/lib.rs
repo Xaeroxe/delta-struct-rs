@@ -71,6 +71,19 @@ mod tests {
         unordered: Vec<i32>,
     }
 
+    #[derive(Clone, Debug, Delta, PartialEq)]
+    struct DeviceConfig {
+        #[delta_struct(field_type = "unordered")]
+        pub services: Vec<String>,
+        #[delta_struct(field_type = "unordered")]
+        pub settings: Vec<String>,
+        pub thumbnail_request: i32,
+        pub speedtest_request: i32,
+        #[delta_struct(field_type = "delta")]
+        pub features: AllFieldTypes,
+        pub deprovision: bool,
+    }
+
     #[test]
     fn unordered_with_scalar() {
         let old = SimpleCollectionWithGeneric {
@@ -163,4 +176,3 @@ mod tests {
         assert_eq!(new_clone, old_delta_applied);
     }
 }
-

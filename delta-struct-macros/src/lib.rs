@@ -102,7 +102,7 @@ pub fn derive_delta(input: TokenStream) -> TokenStream {
     };
     let (delta_compute_let, delta_compute_fields) =
         delta_compute_fields(named, fields.iter().cloned());
-    let delta_apply_actions = delta_apply_fields(named, fields.into_iter());
+    let (delta_apply_let, delta_apply_actions) = delta_apply_fields(named, fields.into_iter());
     let partial_eq_types = generics
         .type_params()
         .map(|t| t.ident.clone())
@@ -149,7 +149,10 @@ pub fn derive_delta(input: TokenStream) -> TokenStream {
            }
           }
 
-          fn apply_delta(&mut self, mut delta: Self::Output) {
+          fn apply_delta(&mut self, delta: Self::Output) {
+            let Self::Output {
+                #delta_apply_let
+            } = delta;
             #delta_apply_actions
           }
       }
@@ -166,7 +169,7 @@ fn delta_fields(
     named: bool,
     iter: impl Iterator<Item = (String, Type, FieldType, String)>,
 ) -> proc_macro2::TokenStream {
-    ::std::iter::FromIterator::from_iter(iter.map(|(ident, ty, field_ty, field_leader)| {
+    FromIterator::from_iter(iter.map(|(ident, ty, field_ty, field_leader)| {
         let field_leader = proc_macro2::TokenStream::from_str(&field_leader).unwrap();
         let ident = if named {
             format_ident!("{}", ident)
@@ -268,8 +271,8 @@ fn delta_compute_fields(
 fn delta_apply_fields(
     named: bool,
     iter: impl Iterator<Item = (String, Type, FieldType, String)>,
-) -> proc_macro2::TokenStream {
-    let iter = iter.map(|(og_ident, ty, field_ty, _field_leader)| {
+) -> (proc_macro2::TokenStream, proc_macro2::TokenStream) {
+    iter.map(|(og_ident, ty, field_ty, _field_leader)| {
         let ident = if named {
             format_ident!("{}", og_ident)
         } else {
@@ -281,37 +284,52 @@ fn delta_apply_fields(
             FieldType::Unordered => {
                 let add = format_ident!("{}_add", ident);
                 let remove = format_ident!("{}_remove", ident);
-                quote! {
-                    {
-                        let og = ::std::mem::replace(&mut self.#og_ident, ::std::iter::FromIterator::from_iter(vec![]));
-                        let mut #ident: #ty = ::std::iter::FromIterator::from_iter(og.into_iter().filter_map(|i| {
-                           if let Some(index) = delta.#remove.iter().position(|a| a == &i) {
-                             delta.#remove.remove(index);
-                             None
-                           } else {
-                             Some(i)
-                           }
-                        }));
-                        #ident.extend(delta.#add.into_iter());
-                        self.#og_ident = #ident;
+                (
+                    quote! {
+                        #add,
+                        mut #remove,
+                    },
+                    quote! {
+                        {
+                            let og = ::std::mem::replace(&mut self.#og_ident, ::std::iter::FromIterator::from_iter(vec![]));
+                            let mut #ident: #ty = ::std::iter::FromIterator::from_iter(og.into_iter().filter_map(|i| {
+                               if let Some(index) = #remove.iter().position(|a| a == &i) {
+                                 #remove.remove(index);
+                                 None
+                               } else {
+                                 Some(i)
+                               }
+                            }));
+                            #ident.extend(#add.into_iter());
+                            self.#og_ident = #ident;
+                        }
                     }
-                }
+                )
             }
             FieldType::Scalar => 
+            (
                 quote! {
-                   if let Some(v) = delta.#ident.take() {
+                    #ident,
+                },
+                quote! {
+                   if let Some(v) = #ident {
                        self.#og_ident = v; 
                    }
-                },
+                }
+            ),
             FieldType::Delta => 
+            (
+                quote! {
+                    #ident,
+                },
                 quote!{
-                   if let Some(v) = delta.#ident.take() {
+                   if let Some(v) = #ident {
                        self.#og_ident.apply_delta(v); 
                    }
-                },
+                }
+            ),
         }
-    });
-    proc_macro2::TokenStream::from_iter(iter)
+    }).unzip()
 }
 
 fn collect_results(

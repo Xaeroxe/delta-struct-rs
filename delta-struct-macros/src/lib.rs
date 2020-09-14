@@ -180,21 +180,21 @@ fn delta_fields(
                 let remove = format_ident!("{}_remove", ident);
                 quote! {
                  #field_leader
-                 #add: Vec<<#ty as ::std::iter::IntoIterator>::Item>,
+                 pub #add: Vec<<#ty as ::std::iter::IntoIterator>::Item>,
                  #field_leader
-                 #remove: Vec<<#ty as ::std::iter::IntoIterator>::Item>,
+                 pub #remove: Vec<<#ty as ::std::iter::IntoIterator>::Item>,
                 }
             }
             FieldType::Scalar => {
                 quote! {
                   #field_leader
-                  #ident: ::std::option::Option<#ty>,
+                  pub #ident: ::std::option::Option<#ty>,
                 }
             }
             FieldType::Delta => {
                 quote! {
                     #field_leader
-                    #ident: ::std::option::Option<<#ty as Delta>::Output>,
+                    pub #ident: ::std::option::Option<<#ty as Delta>::Output>,
                 }
             }
         }

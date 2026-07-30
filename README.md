@@ -8,7 +8,7 @@ This can be combined with `serde` to only transmit changes to structures, when u
 
 ```toml
 [dependencies]
-delta-struct = "0.1"
+delta-struct = "0.2"
 ```
 
 ## Usage

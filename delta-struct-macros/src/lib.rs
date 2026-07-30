@@ -1,8 +1,15 @@
+//! Procedural macro implementation behind the `delta-struct` crate.
+//!
+//! Use [`delta-struct`](https://docs.rs/delta-struct) rather than depending on
+//! this crate directly; it re-exports the [`Delta`] derive alongside the trait
+//! the derive generates an implementation of, and carries the user-facing
+//! documentation.
+
 extern crate proc_macro;
 
 use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenTree};
-use proc_macro_error::abort_call_site;
+use proc_macro_error::{abort_call_site, proc_macro_error};
 use quote::{format_ident, quote};
 use std::{iter::FromIterator, str::FromStr};
 use syn::{
@@ -11,17 +18,74 @@ use syn::{
     TraitBoundModifier, Type, TypeParamBound, WherePredicate,
 };
 
+/// How a single field is diffed, and therefore how it is represented on the
+/// generated delta struct.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum FieldType {
+    /// A positional diff: the delta is a Myers edit script over the sequence.
     Ordered,
+    /// A bag of items: the delta records additions and removals, not order.
     Unordered,
+    /// Compared with `!=` and replaced wholesale.
     Scalar,
+    /// Diffed recursively via the field type's own `Delta` implementation.
     Delta,
 }
 
-const VALID_FIELD_TYPES: &str = "\"ordered\", \"unordered\", or \"scalar\"";
+const VALID_FIELD_TYPES: &str = "\"ordered\", \"unordered\", \"delta\", or \"scalar\"";
 
+/// Derives `Delta`, generating a `{Self}Delta` struct that holds only the
+/// changed parts of a value plus the trait implementation that produces and
+/// applies one.
+///
+/// The generated struct takes the visibility and generic parameters of the
+/// type it is derived on, and all of its fields are `pub`. See the
+/// [`delta-struct`](https://docs.rs/delta-struct) crate documentation for the
+/// full picture, including trait bounds, serde usage, and limitations; what
+/// follows is the attribute reference.
+///
+/// # Container attributes
+///
+/// | Attribute | Effect |
+/// | --- | --- |
+/// | `default = "<field type>"` | Field type for fields that don't specify one. Defaults to `"scalar"`. |
+/// | `delta_leader = "<tokens>"` | Tokens emitted directly above the generated struct — derives, doc comments, anything. |
+///
+/// # Field attributes
+///
+/// | Attribute | Effect |
+/// | --- | --- |
+/// | `field_type = "<field type>"` | How this field is diffed. Overrides the container's `default`. |
+/// | `delta_leader = "<tokens>"` | Tokens emitted directly above the generated field. On an `unordered` field they land above both the `_add` and the `_remove` field. |
+///
+/// # Field types
+///
+/// | Value | Delta representation | Requires |
+/// | --- | --- | --- |
+/// | `"scalar"` | `Option<T>` | `T: PartialEq` |
+/// | `"unordered"` | `{field}_add` and `{field}_remove`, both `Vec<Item>` | `T: IntoIterator + FromIterator<Item> + Extend<Item>`, `Item: PartialEq` |
+/// | `"ordered"` | `SeqDelta<Item>`, a Myers edit script | `T: IntoIterator + FromIterator<Item>`, `Item: Hash + Eq` |
+/// | `"delta"` | `Option<<T as Delta>::Output>` | `T: Delta` |
+///
+/// # Example
+///
+/// ```ignore
+/// use delta_struct::Delta;
+///
+/// #[derive(Delta)]
+/// #[delta_struct(delta_leader = "#[derive(Debug)]")]
+/// struct Device {
+///     #[delta_struct(field_type = "unordered")]
+///     services: Vec<String>,
+///     online: bool,
+/// }
+/// ```
+///
+/// The example is not run as a doctest because this crate cannot depend on the
+/// crate that re-exports it; the tested versions live in the `delta-struct`
+/// crate documentation.
 #[proc_macro_derive(Delta, attributes(delta_struct))]
+#[proc_macro_error]
 pub fn derive_delta(input: TokenStream) -> TokenStream {
     let DeriveInput {
         attrs,
@@ -30,16 +94,17 @@ pub fn derive_delta(input: TokenStream) -> TokenStream {
         mut generics,
         data,
     } = parse_macro_input!(input as DeriveInput);
-    let (default_field_type, delta_leader) = match get_fieldtype_from_attrs(attrs.into_iter(), "default") {
-        Ok((v, delta_leader)) => (v.unwrap_or(FieldType::Scalar), delta_leader),
-        Err(_) => {
-            abort_call_site!(
-                "delta_struct(default = ...) for {} is not an accepted value, expected {}.",
-                ident,
-                VALID_FIELD_TYPES
-            );
-        }
-    };
+    let (default_field_type, delta_leader) =
+        match get_fieldtype_from_attrs(attrs.into_iter(), "default") {
+            Ok((v, delta_leader)) => (v.unwrap_or(FieldType::Scalar), delta_leader),
+            Err(_) => {
+                abort_call_site!(
+                    "delta_struct(default = ...) for {} is not an accepted value, expected {}.",
+                    ident,
+                    VALID_FIELD_TYPES
+                );
+            }
+        };
 
     let (named, fields) = match data {
         Data::Struct(strukt) => match strukt.fields {
@@ -69,9 +134,7 @@ pub fn derive_delta(input: TokenStream) -> TokenStream {
                     default_field_type,
                 ),
             ),
-            Fields::Unit => {
-                (false, Ok(vec![]))
-            }
+            Fields::Unit => (false, Ok(vec![])),
         },
         _ => {
             abort_call_site!(
@@ -91,18 +154,33 @@ pub fn derive_delta(input: TokenStream) -> TokenStream {
             )
         }
     };
-    let delta_leader = proc_macro2::TokenStream::from_str(&delta_leader).unwrap();
+    let delta_leader = match proc_macro2::TokenStream::from_str(&delta_leader) {
+        Ok(v) => v,
+        Err(e) => {
+            abort_call_site!("error parsing delta leader as token stream {}", e);
+        }
+    };
     let delta_ident = format_ident!("{}Delta", ident);
     let delta_fields = delta_fields(named, fields.iter().cloned());
+    // The delta struct repeats the source type's generics verbatim, bounds and
+    // all, since its fields can project through them — `<T as Delta>::Output`
+    // for a delta field, `<T as IntoIterator>::Item` for an unordered one. Grab
+    // the where clause before the `PartialEq` predicates below are pushed onto
+    // it; those are the impl's business, not the struct's.
+    let og_where_clause = generics.where_clause.clone();
     let delta_struct = quote! {
       #delta_leader
-      #vis struct #delta_ident #generics {
+      #vis struct #delta_ident #generics #og_where_clause {
           #delta_fields
       }
     };
     let (delta_compute_let, delta_compute_fields) =
         delta_compute_fields(named, fields.iter().cloned());
     let (delta_apply_let, delta_apply_actions) = delta_apply_fields(named, fields.into_iter());
+    // Scalar and unordered fields compare values with `==`, so every type
+    // parameter picks up a `PartialEq` bound on the impl. This is broader than
+    // strictly necessary — a parameter used only by a `delta` field does not
+    // need it.
     let partial_eq_types = generics
         .type_params()
         .map(|t| t.ident.clone())
@@ -135,7 +213,9 @@ pub fn derive_delta(input: TokenStream) -> TokenStream {
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
     let delta_impl = quote! {
       impl #impl_generics Delta for #ident #ty_generics #where_clause  {
-          type Output = #delta_ident #generics;
+          // `ty_generics` and not `generics`: the latter renders parameter
+          // bounds too, which are not allowed in a type position.
+          type Output = #delta_ident #ty_generics;
 
           fn delta(old: Self, new: Self) -> Option<Self::Output> {
            let mut delta_is_some = false;
@@ -165,6 +245,13 @@ pub fn derive_delta(input: TokenStream) -> TokenStream {
     TokenStream::from(output)
 }
 
+/// Emits the field declarations of the generated delta struct.
+///
+/// Fields arrive as `(name, type, field type, delta_leader)`, where `name` is
+/// the source field's name or, for tuple structs, its index. `named` says
+/// which of the two it is: tuple struct fields become `field_0`, `field_1`,
+/// and so on, because a tuple struct has nowhere to put the `_add`/`_remove`
+/// pair an unordered field expands into.
 fn delta_fields(
     named: bool,
     iter: impl Iterator<Item = (String, Type, FieldType, String)>,
@@ -177,7 +264,12 @@ fn delta_fields(
             format_ident!("field_{}", ident)
         };
         match field_ty {
-            FieldType::Ordered => unimplemented!(),
+            FieldType::Ordered => {
+                quote! {
+                    #field_leader
+                    pub #ident: ::delta_struct::SeqDelta<<#ty as ::std::iter::IntoIterator>::Item>,
+                }
+            }
             FieldType::Unordered => {
                 let add = format_ident!("{}_add", ident);
                 let remove = format_ident!("{}_remove", ident);
@@ -204,6 +296,12 @@ fn delta_fields(
     }))
 }
 
+/// Emits the body of `Delta::delta`, as `(statements, struct initializer)`.
+///
+/// The statements bind one local per generated field and set `delta_is_some`
+/// whenever they find a real change; the initializer then moves those locals
+/// into the delta struct. Fields arrive in the same shape as in
+/// [`delta_fields`].
 fn delta_compute_fields(
     named: bool,
     iter: impl Iterator<Item = (String, Type, FieldType, String)>,
@@ -216,13 +314,25 @@ fn delta_compute_fields(
         };
         let og_ident: proc_macro2::TokenStream = FromStr::from_str(&og_ident).unwrap();
         match field_ty {
-            FieldType::Ordered => unimplemented!(),
+            FieldType::Ordered => (
+                quote! {
+                    let #ident = ::delta_struct::seq::diff(old.#og_ident, new.#og_ident);
+                    delta_is_some = delta_is_some || !#ident.is_empty();
+                },
+                quote! {
+                    #ident,
+                },
+            ),
             FieldType::Unordered => {
                 let add = format_ident!("{}_add", ident);
                 let remove = format_ident!("{}_remove", ident);
 
                 (
                     quote! {
+                        // Start from every item in `new` and cancel out the
+                        // ones `old` also had, one occurrence at a time, so
+                        // duplicates are counted rather than deduplicated.
+                        // Whatever is left in `old` is what was removed.
                         let mut #add = new.#og_ident.into_iter().collect::<::std::vec::Vec<_>>();
                         let #remove = old.#og_ident.into_iter().filter_map(|i| {
                             if let Some(index) = #add.iter().position(|a| a == &i) {
@@ -268,6 +378,13 @@ fn delta_compute_fields(
     .unzip()
 }
 
+/// Emits the body of `Delta::apply_delta`, as `(destructuring pattern,
+/// statements)`.
+///
+/// The pattern takes the delta struct apart into locals — binding the
+/// `_remove` lists as `mut`, since applying them consumes their entries — and
+/// the statements write each change back into `self`. Fields arrive in the
+/// same shape as in [`delta_fields`].
 fn delta_apply_fields(
     named: bool,
     iter: impl Iterator<Item = (String, Type, FieldType, String)>,
@@ -280,7 +397,14 @@ fn delta_apply_fields(
         };
         let og_ident: proc_macro2::TokenStream = FromStr::from_str(&og_ident).unwrap();
         match field_ty {
-            FieldType::Ordered => unimplemented!(),
+            FieldType::Ordered => (
+                quote! {
+                    #ident,
+                },
+                quote! {
+                    ::delta_struct::seq::apply(&mut self.#og_ident, #ident);
+                },
+            ),
             FieldType::Unordered => {
                 let add = format_ident!("{}_add", ident);
                 let remove = format_ident!("{}_remove", ident);
@@ -291,6 +415,11 @@ fn delta_apply_fields(
                     },
                     quote! {
                         {
+                            // Take the collection by value so its items can be
+                            // moved through the filter, then rebuild it minus
+                            // the removals and plus the additions. Note that
+                            // this does not preserve position for ordered
+                            // collections — additions land at the end.
                             let og = ::std::mem::replace(&mut self.#og_ident, ::std::iter::FromIterator::from_iter(vec![]));
                             let mut #ident: #ty = ::std::iter::FromIterator::from_iter(og.into_iter().filter_map(|i| {
                                if let Some(index) = #remove.iter().position(|a| a == &i) {
@@ -306,25 +435,25 @@ fn delta_apply_fields(
                     }
                 )
             }
-            FieldType::Scalar => 
+            FieldType::Scalar =>
             (
                 quote! {
                     #ident,
                 },
                 quote! {
                    if let Some(v) = #ident {
-                       self.#og_ident = v; 
+                       self.#og_ident = v;
                    }
                 }
             ),
-            FieldType::Delta => 
+            FieldType::Delta =>
             (
                 quote! {
                     #ident,
                 },
                 quote!{
                    if let Some(v) = #ident {
-                       self.#og_ident.apply_delta(v); 
+                       self.#og_ident.apply_delta(v);
                    }
                 }
             ),
@@ -332,8 +461,17 @@ fn delta_apply_fields(
     }).unzip()
 }
 
+/// Resolves each field's parsed attributes against the container default,
+/// collecting *every* bad field rather than stopping at the first, so one
+/// compile reports them all.
 fn collect_results(
-    iter: impl Iterator<Item = (String, Type, Result<(Option<FieldType>, String), FieldTypeError>)>,
+    iter: impl Iterator<
+        Item = (
+            String,
+            Type,
+            Result<(Option<FieldType>, String), FieldTypeError>,
+        ),
+    >,
     default_field_type: FieldType,
 ) -> Result<Vec<(String, Type, FieldType, String)>, Vec<String>> {
     iter.fold(Ok(vec![]), |v, i| match (v, i) {
@@ -351,9 +489,19 @@ fn collect_results(
 }
 
 enum FieldTypeError {
-    UnrecognizedJunkFound(Vec<NestedMeta>),
+    /// The `delta_struct(...)` attribute contained entries that were not
+    /// `name = "value"` pairs.
+    UnrecognizedJunkFound,
 }
 
+/// Reads a `#[delta_struct(...)]` attribute, returning
+/// `(field type, delta_leader)`.
+///
+/// `attr_name` is the key naming the field type in this position — `"default"`
+/// on a container, `"field_type"` on a field — because the two spellings mean
+/// the same thing at different scopes. The field type is `None` when the
+/// attribute is absent or names no field type, leaving the caller to fill in
+/// the default; `delta_leader` is empty when unspecified.
 fn get_fieldtype_from_attrs(
     iter: impl Iterator<Item = Attribute>,
     attr_name: &str,
@@ -396,10 +544,10 @@ fn get_fieldtype_from_attrs(
                             match i.0.as_deref() {
                                 Some("delta_leader") => {
                                     delta_leader = i.1;
-                                },
+                                }
                                 a @ _ if Some(attr_name) == a => {
-                                   field_type = string_to_fieldtype(&i.1); 
-                                },
+                                    field_type = string_to_fieldtype(&i.1);
+                                }
                                 a @ _ => {
                                     abort_call_site!("Unrecognized value {:?}", a);
                                 }
@@ -407,7 +555,7 @@ fn get_fieldtype_from_attrs(
                         }
                         Ok((field_type, delta_leader))
                     }
-                    Err(v) => Err(FieldTypeError::UnrecognizedJunkFound(v)),
+                    Err(_) => Err(FieldTypeError::UnrecognizedJunkFound),
                 };
             }
         }
@@ -415,6 +563,8 @@ fn get_fieldtype_from_attrs(
     Ok((None, String::new()))
 }
 
+/// Maps the attribute spelling of a field type to its variant, or `None` if it
+/// is not one of the recognized names.
 fn string_to_fieldtype(s: &str) -> Option<FieldType> {
     match s {
         "ordered" => Some(FieldType::Ordered),

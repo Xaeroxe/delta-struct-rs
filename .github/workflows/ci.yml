@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+# Superseded runs on a pull request are pointless; a push to master is not, so
+# only cancel the former.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # Cargo compiles registry dependencies with `--cap-lints allow`, so this
+  # denies warnings in this workspace's own code without breaking the build
+  # when a dependency picks up a new lint.
+  RUSTFLAGS: -D warnings
+  RUSTDOCFLAGS: -D warnings
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  test:
+    name: build & test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # `--all-targets` covers the non-test build, which `cargo test` alone
+      # would not catch.
+      - name: Build
+        run: cargo build --workspace --all-targets
+      # Default features are what most users get, so check them on their own
+      # before turning everything on. Neither command passes `--all-targets`:
+      # that flag silently drops doctests, and this crate's documentation
+      # examples are most of its test suite.
+      - name: Test (default features)
+        run: cargo test --workspace
+      - name: Test (all features)
+        run: cargo test --workspace --all-features
+
+  docs:
+    name: rustdoc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Catches broken intra-doc links, which nothing else here would.
+      - run: cargo doc --workspace --no-deps --all-features

@@ -8,7 +8,7 @@ license = "MIT OR Apache-2.0"
 description = "Delta struct provides a rust-lang Deriveable trait, Delta, that can be used to compute the difference (aka delta) between two instances of a type."
 
 [lib]
-proc_macro = true
+proc-macro = true
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

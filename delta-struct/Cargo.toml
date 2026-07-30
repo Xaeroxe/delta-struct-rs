@@ -1,9 +1,9 @@
 [package]
 name = "delta-struct"
 version = "0.1.0"
-authors = ["jacobkiesel <jacob.kiesel@vivint.com>"]
+authors = ["Jacob Kiesel <jake@bitcrafters.co>"]
 edition = "2018"
-repository = "https://github.com/vivint-smarthome/delta-struct-rs"
+repository = "https://github.com/Xaeroxe/delta-struct-rs"
 license = "MIT OR Apache-2.0"
 description = "Delta struct provides a rust-lang Deriveable trait, Delta, that can be used to compute the difference (aka delta) between two instances of a type."
 

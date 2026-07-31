@@ -464,6 +464,7 @@ fn delta_apply_fields(
 /// Resolves each field's parsed attributes against the container default,
 /// collecting *every* bad field rather than stopping at the first, so one
 /// compile reports them all.
+#[allow(clippy::manual_try_fold)] // Collects errors too
 fn collect_results(
     iter: impl Iterator<
         Item = (
@@ -502,6 +503,7 @@ enum FieldTypeError {
 /// the same thing at different scopes. The field type is `None` when the
 /// attribute is absent or names no field type, leaving the caller to fill in
 /// the default; `delta_leader` is empty when unspecified.
+#[allow(clippy::manual_try_fold)] // Collects errors too
 fn get_fieldtype_from_attrs(
     iter: impl Iterator<Item = Attribute>,
     attr_name: &str,
@@ -522,7 +524,7 @@ fn get_fieldtype_from_attrs(
                             lit: Lit::Str(s),
                             ..
                         })) => Ok((path.get_ident().map(|i| i.to_string()), s.value())),
-                        e @ _ => Err(e),
+                        e => Err(e),
                     })
                     .fold(Ok(vec![]), |v, i| match (v, i) {
                         (Ok(mut v), Ok(i)) => {
@@ -545,10 +547,10 @@ fn get_fieldtype_from_attrs(
                                 Some("delta_leader") => {
                                     delta_leader = i.1;
                                 }
-                                a @ _ if Some(attr_name) == a => {
+                                a if Some(attr_name) == a => {
                                     field_type = string_to_fieldtype(&i.1);
                                 }
-                                a @ _ => {
+                                a => {
                                     abort_call_site!("Unrecognized value {:?}", a);
                                 }
                             }

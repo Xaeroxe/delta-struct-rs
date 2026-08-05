@@ -1,6 +1,6 @@
 [package]
 name = "delta-struct-macros"
-version = "0.2.0"
+version = "0.3.0"
 authors = ["Jacob Kiesel <jake@bitcrafters.co>"]
 edition = "2018"
 repository = "https://github.com/Xaeroxe/delta-struct-rs"

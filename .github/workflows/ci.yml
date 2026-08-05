@@ -40,6 +40,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets
       # `--all-targets` covers the non-test build, which `cargo test` alone
       # would not catch.
       - name: Build

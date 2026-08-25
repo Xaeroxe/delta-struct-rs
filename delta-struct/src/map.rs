@@ -10,7 +10,7 @@
 //! The derive emits calls to [`diff`] and [`apply`]; you only need this module
 //! directly to inspect or construct a delta by hand.
 
-use crate::{Delta, TryIndex, TryIndexMut};
+use crate::{Delta, Mismatch, TryIndex, TryIndexMut};
 
 /// An entry that splits into a key and a value.
 ///
@@ -178,6 +178,11 @@ where
 ///
 /// A key in `remove` or `change` that `target` does not have is ignored.
 ///
+/// This is the one collection helper that can fail, because it is the one that
+/// recurses into [`Delta::apply_delta`]: a map of enums can be handed a change
+/// whose value has since moved to another variant. The error propagates rather
+/// than being swallowed, and leaves the map partly updated.
+///
 /// ```
 /// use delta_struct::{map, Delta};
 /// use std::collections::BTreeMap;
@@ -195,10 +200,14 @@ where
 ///
 /// let delta = map::diff(services(80), services(8080));
 /// let mut target = services(80);
-/// map::apply(&mut target, delta);
+/// map::apply(&mut target, delta)?;
 /// assert_eq!(target["web"].port, 8080);
+/// # Ok::<(), delta_struct::Mismatch>(())
 /// ```
-pub fn apply<C, E>(target: &mut C, delta: MapDelta<E::Key, E::Value, <E::Value as Delta>::Output>)
+pub fn apply<C, E>(
+    target: &mut C,
+    delta: MapDelta<E::Key, E::Value, <E::Value as Delta>::Output>,
+) -> Result<(), Mismatch>
 where
     C: IntoIterator<Item = E> + Extend<E> + TryIndexMut<E::Key, Output = E::Value>,
     E: MapEntry,
@@ -214,11 +223,12 @@ where
     }
     for KeyedDelta { key, delta } in change {
         if let Some(value) = target.try_index_mut(&key) {
-            value.apply_delta(delta);
+            value.apply_delta(delta)?;
         }
     }
     target.extend(
         add.into_iter()
             .map(|(key, value)| E::from_parts(key, value)),
     );
+    Ok(())
 }

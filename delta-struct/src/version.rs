@@ -41,7 +41,7 @@
 //! assert_eq!(receiver.get().port, 8080);
 //! ```
 
-use crate::{fingerprint_of, Delta, Fingerprint};
+use crate::{fingerprint_of, Delta, Fingerprint, Mismatch};
 use std::fmt;
 
 /// A delta, plus everything needed to tell whether it belongs here.
@@ -79,7 +79,7 @@ impl<T> Versioned<T> {
     /// Starts a value at version 0.
     ///
     /// Both ends have to start from the same value; sending a `Versioned<T>`
-    /// whole is how a receiver catches up after a [`Mismatch`].
+    /// whole is how a receiver catches up after a [`Rejected`].
     pub fn new(value: T) -> Self {
         Versioned { value, version: 0 }
     }
@@ -139,33 +139,38 @@ impl<T: Delta + Fingerprint> Versioned<T> {
     ///
     /// A delta that has already been applied is reported as
     /// [`Applied::Stale`] and does nothing, so duplicate delivery is safe. A
-    /// [`Mismatch`] leaves the version untouched, which means a later delta in
+    /// [`Rejected`] leaves the version untouched, which means a later delta in
     /// the same stream will fail too rather than papering over the hole — the
     /// only way forward is to replace the whole value.
-    pub fn apply(&mut self, delta: VersionedDelta<T::Output>) -> Result<Applied, Mismatch> {
+    pub fn apply(&mut self, delta: VersionedDelta<T::Output>) -> Result<Applied, Rejected> {
         if delta.to <= self.version {
             return Ok(Applied::Stale);
         }
         if delta.from != self.version {
-            return Err(Mismatch::Gap {
+            return Err(Rejected::Gap {
                 expected: self.version,
                 found: delta.from,
             });
         }
         let found = fingerprint_of(&self.value);
         if found != delta.base {
-            return Err(Mismatch::Base {
+            return Err(Rejected::Base {
                 expected: delta.base,
                 found,
             });
         }
-        self.value.apply_delta(delta.delta);
+        // The base fingerprint matched, so the value is the one the delta was
+        // built against and an enum's variants line up — this can only fire on
+        // a fingerprint collision or a bug, which is worth being able to say.
+        self.value
+            .apply_delta(delta.delta)
+            .map_err(Rejected::Apply)?;
         let found = fingerprint_of(&self.value);
         if found != delta.result {
             // The value is now wrong, and deliberately left that way: the
             // version has not advanced, so the next delta cannot be mistaken
             // for a clean apply.
-            return Err(Mismatch::Result {
+            return Err(Rejected::Result {
                 expected: delta.result,
                 found,
             });
@@ -190,7 +195,7 @@ pub enum Applied {
 /// catch up from deltas and needs the whole value resent — but they say
 /// different things about what went wrong.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Mismatch {
+pub enum Rejected {
     /// A delta was missed: this one was computed against a version that was
     /// never reached. The stream lost or reordered a message.
     Gap {
@@ -217,23 +222,31 @@ pub enum Mismatch {
         /// The fingerprint applying actually produced.
         found: u64,
     },
+    /// The delta did not fit the value's shape at all — an enum delta built
+    /// for one variant meeting a value in another.
+    ///
+    /// The [`base`](VersionedDelta::base) fingerprint is checked first and
+    /// would normally have caught that, so reaching this means a fingerprint
+    /// collision or a bug rather than ordinary divergence.
+    Apply(Mismatch),
 }
 
-impl fmt::Display for Mismatch {
+impl fmt::Display for Rejected {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Mismatch::Gap { expected, found } => write!(
+            Rejected::Gap { expected, found } => write!(
                 f,
                 "missed a delta: at version {}, but this one starts from {}",
                 expected, found
             ),
-            Mismatch::Base { expected, found } => write!(
+            Rejected::Base { expected, found } => write!(
                 f,
                 "state has diverged: delta was computed against fingerprint {:#018x}, \
                  but this value is {:#018x}",
                 expected, found
             ),
-            Mismatch::Result { expected, found } => write!(
+            Rejected::Apply(mismatch) => write!(f, "{}", mismatch),
+            Rejected::Result { expected, found } => write!(
                 f,
                 "delta applied to the wrong result: expected fingerprint {:#018x}, \
                  got {:#018x}",
@@ -243,4 +256,4 @@ impl fmt::Display for Mismatch {
     }
 }
 
-impl std::error::Error for Mismatch {}
+impl std::error::Error for Rejected {}

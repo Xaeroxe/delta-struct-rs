@@ -1,9 +1,15 @@
-//! Membership diffing, behind the `unordered` field type.
+//! Membership diffing, behind the `unordered` field type when the field is a
+//! set.
 //!
-//! A field marked `#[delta_struct(field_type = "unordered")]` is treated as a
+//! A set marked `#[delta_struct(field_type = "unordered")]` is treated as a
 //! bag of elements whose order carries no meaning, and represented as a
 //! [`BagDelta`] — which elements came and which went, and nothing about where
 //! they sit.
+//!
+//! A map marked the same way gets an [`EntryDelta`](crate::EntryDelta)
+//! instead, since it can name a departing entry by key alone; see
+//! [`entry`](crate::entry). [`Unordered`](crate::Unordered) is what picks
+//! between the two.
 //!
 //! The derive emits calls to [`diff`] and [`apply`]; you only need this module
 //! directly to inspect or construct a delta by hand.

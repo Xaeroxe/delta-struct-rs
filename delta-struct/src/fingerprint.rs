@@ -2,8 +2,8 @@
 //! applied to the state it was computed against.
 //!
 //! [`std::hash::Hash`] cannot do this job for two reasons. It is not
-//! implemented for [`HashSet`] or [`HashMap`], which are exactly the
-//! collections the `unordered` field types require, and the hash it feeds a
+//! implemented for [`HashSet`] or [`HashMap`], which are important
+//! collections for the `unordered` field type, and the hash it feeds a
 //! [`DefaultHasher`](std::collections::hash_map::DefaultHasher) is explicitly
 //! allowed to change between Rust releases — fine for a hash table that lives
 //! and dies in one process, useless for a value two processes have to agree

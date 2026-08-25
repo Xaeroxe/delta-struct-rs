@@ -8,9 +8,9 @@
 extern crate proc_macro;
 
 use proc_macro::TokenStream;
-use proc_macro2::{Span, TokenTree};
+use proc_macro2::{Span, TokenStream as TokenStream2, TokenTree};
 use proc_macro_error::{abort_call_site, proc_macro_error};
-use quote::{format_ident, quote};
+use quote::{format_ident, quote, ToTokens};
 use std::{iter::FromIterator, str::FromStr};
 use syn::{
     parse_macro_input, punctuated::Punctuated, Attribute, Data, DeriveInput, Fields, Ident, Lit,
@@ -25,6 +25,8 @@ enum FieldType {
     /// A positional diff: the delta is a Myers edit script over the sequence.
     Ordered,
     /// A bag of items: the delta records additions and removals, not order.
+    /// Its shape is the collection's to choose, through `Unordered`, since a
+    /// map can name a departing entry by key where a set cannot.
     Unordered,
     /// A bag of key/value entries: like [`FieldType::Unordered`], except that
     /// entries sharing a key are diffed with the value's own `Delta` rather
@@ -56,9 +58,15 @@ type ParsedAttrs = Result<(Option<FieldType>, String), FieldTypeError>;
 /// changed parts of a value plus the trait implementation that produces and
 /// applies one.
 ///
-/// The generated struct takes the visibility and generic parameters of the
-/// type it is derived on, and all of its fields are `pub`. A tuple struct's
-/// delta is a tuple struct in turn, with its fields in the same positions.
+/// The generated type takes the visibility and generic parameters of the type
+/// it is derived on, and mirrors its shape: a tuple struct's delta is a tuple
+/// struct with its fields in the same positions, and an enum's is an enum with
+/// one variant per *diffable* source variant. A struct's delta fields are all
+/// `pub`.
+///
+/// For an enum, `Output` is `EnumDelta<Self, {Self}Delta>` rather than the
+/// bare companion, because a value can change variant as well as change within
+/// one — and changing variant is a replacement rather than a difference.
 ///
 /// See the [`delta-struct`](https://docs.rs/delta-struct) crate documentation
 /// for the full picture, including trait bounds, serde usage, and limitations;
@@ -85,7 +93,7 @@ type ParsedAttrs = Result<(Option<FieldType>, String), FieldTypeError>;
 /// | Value | Delta representation | Requires |
 /// | --- | --- | --- |
 /// | `"scalar"` | `Option<T>` | `T: PartialEq` |
-/// | `"unordered"` | `BagDelta<Item>`, an `add` and a `remove` | `T: IntoIterator + Extend<Item> + TryIndex<Item, Output = Item>` |
+/// | `"unordered"` | `<T as Unordered>::Delta` — `BagDelta<Item>` for a set, `EntryDelta<Key, Value>` for a map | `T: Unordered` |
 /// | `"unordered-delta"` | `MapDelta<Key, Value, <Value as Delta>::Output>`, an `add`, a `remove`, and a `change` | `T: IntoIterator + Extend<Item> + TryIndexMut<Key, Output = Value> Item: MapEntry` (so `(K, V)`), `Value: Delta` |
 /// | `"ordered"` | `SeqDelta<Item>`, a Myers edit script | `T: IntoIterator + FromIterator<Item>`, `Item: Hash + Eq` |
 /// | `"delta"` | `Option<<T as Delta>::Output>` | `T: Delta` |
@@ -125,54 +133,6 @@ pub fn derive_delta(input: TokenStream) -> TokenStream {
             }
         };
 
-    let (named, fields) = match data {
-        Data::Struct(strukt) => match strukt.fields {
-            Fields::Named(named) => (
-                true,
-                collect_results(
-                    named.named.into_iter().map(|field| {
-                        (
-                            field.ident.unwrap().to_string(),
-                            field.ty,
-                            get_fieldtype_from_attrs(field.attrs.into_iter(), "field_type"),
-                        )
-                    }),
-                    default_field_type,
-                ),
-            ),
-            Fields::Unnamed(unnamed) => (
-                false,
-                collect_results(
-                    unnamed.unnamed.into_iter().enumerate().map(|(i, field)| {
-                        (
-                            i.to_string(),
-                            field.ty,
-                            get_fieldtype_from_attrs(field.attrs.into_iter(), "field_type"),
-                        )
-                    }),
-                    default_field_type,
-                ),
-            ),
-            Fields::Unit => (false, Ok(vec![])),
-        },
-        _ => {
-            abort_call_site!(
-                "delta_struct::Delta may only be derived for struct types currently. {} is not a struct type."
-            , ident)
-        }
-    };
-    let fields = match fields {
-        Ok(fields) => fields,
-        Err(bad_fields) => {
-            let bad_fields = format!("{:?}", bad_fields);
-            abort_call_site!(
-                "delta_struct(field_type = ...) for fields in {}: {} are not valid values. Expected {}.",
-                ident,
-                bad_fields,
-                VALID_FIELD_TYPES
-            )
-        }
-    };
     let delta_leader = match proc_macro2::TokenStream::from_str(&delta_leader) {
         Ok(v) => v,
         Err(e) => {
@@ -180,44 +140,48 @@ pub fn derive_delta(input: TokenStream) -> TokenStream {
         }
     };
     let delta_ident = format_ident!("{}Delta", ident);
-    let delta_fields = delta_fields(named, fields.iter().cloned());
-    // The delta struct repeats the source type's generics verbatim, bounds and
+    // The delta type repeats the source type's generics verbatim, bounds and
     // all, since its fields can project through them — `<T as Delta>::Output`
     // for a delta field, `<T as IntoIterator>::Item` for an unordered one. Grab
     // the where clause before the `PartialEq` predicates below are pushed onto
-    // it; those are the impl's business, not the struct's.
+    // it; those are the impl's business, not the type's.
     let og_where_clause = generics.where_clause.clone();
-    let (delta_compute_let, delta_compute_fields) =
-        delta_compute_fields(named, fields.iter().cloned());
-    let (delta_apply_let, delta_apply_actions) = delta_apply_fields(named, fields.into_iter());
-    // A tuple struct's delta is a tuple struct too, which means the
-    // declaration, the initializer, and the destructuring pattern all have to
-    // switch from braces to parentheses together. Two things differ beyond the
-    // brackets: a tuple struct puts its `where` clause *after* the fields and
-    // ends in a semicolon, and its constructor lives in the value namespace,
-    // which `Self::Output` — an associated type — cannot reach, so the
-    // initializer and pattern name the struct itself and let inference supply
-    // its generics.
-    let (delta_struct, delta_compute_init, delta_apply_pattern) = if named {
-        (
-            quote! {
-                #delta_leader
-                #vis struct #delta_ident #generics #og_where_clause {
-                    #delta_fields
-                }
-            },
-            quote!(Self::Output { #delta_compute_fields }),
-            quote!(Self::Output { #delta_apply_let }),
-        )
-    } else {
-        (
-            quote! {
-                #delta_leader
-                #vis struct #delta_ident #generics (#delta_fields) #og_where_clause;
-            },
-            quote!(#delta_ident(#delta_compute_fields)),
-            quote!(#delta_ident(#delta_apply_let)),
-        )
+    let ty_generics_only = generics.split_for_impl().1.to_token_stream();
+
+    let Generated {
+        delta_type,
+        output_ty,
+        delta_body,
+        apply_body,
+    } = match data {
+        Data::Struct(strukt) => struct_impl(
+            &ident,
+            &vis,
+            &delta_ident,
+            &delta_leader,
+            &generics,
+            &og_where_clause,
+            &ty_generics_only,
+            strukt.fields,
+            default_field_type,
+        ),
+        Data::Enum(enom) => enum_impl(
+            &ident,
+            &vis,
+            &delta_ident,
+            &delta_leader,
+            &generics,
+            &og_where_clause,
+            &ty_generics_only,
+            enom.variants.into_iter().collect(),
+            default_field_type,
+        ),
+        Data::Union(_) => {
+            abort_call_site!(
+                "delta_struct::Delta may only be derived for struct and enum types. {} is a union.",
+                ident
+            )
+        }
     };
     // Scalar and unordered fields compare values with `==`, so every type
     // parameter picks up a `PartialEq` bound on the impl. This is broader than
@@ -257,30 +221,337 @@ pub fn derive_delta(input: TokenStream) -> TokenStream {
       impl #impl_generics Delta for #ident #ty_generics #where_clause  {
           // `ty_generics` and not `generics`: the latter renders parameter
           // bounds too, which are not allowed in a type position.
-          type Output = #delta_ident #ty_generics;
+          type Output = #output_ty;
 
           fn delta(old: Self, new: Self) -> Option<Self::Output> {
-           let mut delta_is_some = false;
-           #delta_compute_let
-           if delta_is_some {
-               Some(#delta_compute_init)
-           } else {
-               None
-           }
+              #delta_body
           }
 
-          fn apply_delta(&mut self, delta: Self::Output) {
-            let #delta_apply_pattern = delta;
-            #delta_apply_actions
+          // A one-variant enum has no mismatch to catch, and an enum of only
+          // unit variants has an uninhabited delta, which makes the tail of
+          // this unreachable. Both are fine; neither should warn the caller.
+          #[allow(unreachable_patterns, unreachable_code)]
+          fn apply_delta(
+              &mut self,
+              delta: Self::Output,
+          ) -> ::std::result::Result<(), ::delta_struct::Mismatch> {
+              #apply_body
           }
       }
     };
     let output = quote! {
-        #delta_struct
+        #delta_type
 
         #delta_impl
     };
     TokenStream::from(output)
+}
+
+/// The four pieces the struct and enum paths each produce: the delta type's
+/// declaration, the `Output` it becomes, and the two method bodies.
+struct Generated {
+    delta_type: TokenStream2,
+    output_ty: TokenStream2,
+    delta_body: TokenStream2,
+    apply_body: TokenStream2,
+}
+
+/// Reads one group of source fields into the shape the code generators want,
+/// resolving each against the container's default field type.
+///
+/// Returns `(named, fields)`, where `named` says whether the group is written
+/// with braces or with parentheses.
+fn read_fields(owner: &Ident, fields: Fields, default_field_type: FieldType) -> (bool, Vec<Field>) {
+    let (named, collected) = match fields {
+        Fields::Named(named) => (
+            true,
+            collect_results(
+                named.named.into_iter().map(|field| {
+                    (
+                        field.ident.unwrap().to_string(),
+                        field.ty,
+                        get_fieldtype_from_attrs(field.attrs.into_iter(), "field_type"),
+                    )
+                }),
+                default_field_type,
+            ),
+        ),
+        Fields::Unnamed(unnamed) => (
+            false,
+            collect_results(
+                unnamed.unnamed.into_iter().enumerate().map(|(i, field)| {
+                    (
+                        i.to_string(),
+                        field.ty,
+                        get_fieldtype_from_attrs(field.attrs.into_iter(), "field_type"),
+                    )
+                }),
+                default_field_type,
+            ),
+        ),
+        Fields::Unit => (false, Ok(vec![])),
+    };
+    match collected {
+        Ok(fields) => (named, fields),
+        Err(bad_fields) => {
+            let bad_fields = format!("{:?}", bad_fields);
+            abort_call_site!(
+                "delta_struct(field_type = ...) for fields in {}: {} are not valid values. Expected {}.",
+                owner,
+                bad_fields,
+                VALID_FIELD_TYPES
+            )
+        }
+    }
+}
+
+/// Generates the delta of a struct: a companion struct of the same shape, and
+/// two method bodies that walk its fields.
+#[allow(clippy::too_many_arguments)] // All of it is one type's description.
+fn struct_impl(
+    ident: &Ident,
+    vis: &syn::Visibility,
+    delta_ident: &Ident,
+    delta_leader: &TokenStream2,
+    generics: &syn::Generics,
+    og_where_clause: &Option<syn::WhereClause>,
+    ty_generics: &TokenStream2,
+    fields: Fields,
+    default_field_type: FieldType,
+) -> Generated {
+    let (named, fields) = read_fields(ident, fields, default_field_type);
+    let delta_fields = delta_fields(named, fields.iter().cloned());
+    let (compute_let, compute_fields) =
+        delta_compute_fields(named, Source::Whole, fields.iter().cloned());
+    let (apply_let, apply_actions) = delta_apply_fields(named, Source::Whole, fields.into_iter());
+
+    // A tuple struct's delta is a tuple struct too, which means the
+    // declaration, the initializer, and the destructuring pattern all have to
+    // switch from braces to parentheses together. Two things differ beyond the
+    // brackets: a tuple struct puts its `where` clause *after* the fields and
+    // ends in a semicolon, and its constructor lives in the value namespace,
+    // which `Self::Output` — an associated type — cannot reach, so the
+    // initializer and pattern name the struct itself and let inference supply
+    // its generics.
+    let (delta_type, compute_init, apply_pattern) = if named {
+        (
+            quote! {
+                #delta_leader
+                #vis struct #delta_ident #generics #og_where_clause {
+                    #delta_fields
+                }
+            },
+            quote!(Self::Output { #compute_fields }),
+            quote!(Self::Output { #apply_let }),
+        )
+    } else {
+        (
+            quote! {
+                #delta_leader
+                #vis struct #delta_ident #generics (#delta_fields) #og_where_clause;
+            },
+            quote!(#delta_ident(#compute_fields)),
+            quote!(#delta_ident(#apply_let)),
+        )
+    };
+
+    Generated {
+        delta_type,
+        output_ty: quote!(#delta_ident #ty_generics),
+        delta_body: quote! {
+            let mut delta_is_some = false;
+            #compute_let
+            if delta_is_some {
+                Some(#compute_init)
+            } else {
+                None
+            }
+        },
+        // A struct's delta always fits, so this is the arm of `apply_delta`
+        // that can only ever be `Ok` — the `?`s inside come from fields whose
+        // own types are enums.
+        apply_body: quote! {
+            let #apply_pattern = delta;
+            #apply_actions
+            Ok(())
+        },
+    }
+}
+
+/// Generates the delta of an enum.
+///
+/// The companion enum carries one variant per *diffable* source variant — a
+/// field-less variant can never differ from itself, so giving it an arm would
+/// only create one nothing could construct. Changing variant is not a
+/// difference at all but a replacement, and that case lives in
+/// [`EnumDelta::Became`](::delta_struct::EnumDelta), a type in the runtime
+/// crate rather than an arm here, so it cannot collide with a variant the user
+/// wrote.
+#[allow(clippy::too_many_arguments)] // All of it is one type's description.
+fn enum_impl(
+    ident: &Ident,
+    vis: &syn::Visibility,
+    delta_ident: &Ident,
+    delta_leader: &TokenStream2,
+    generics: &syn::Generics,
+    og_where_clause: &Option<syn::WhereClause>,
+    ty_generics: &TokenStream2,
+    variants: Vec<syn::Variant>,
+    default_field_type: FieldType,
+) -> Generated {
+    if variants.is_empty() {
+        abort_call_site!(
+            "delta_struct::Delta cannot be derived for {}, which has no variants: an \
+             uninhabited type has no two values to differ.",
+            ident
+        )
+    }
+
+    let read: Vec<(Ident, bool, Vec<Field>)> = variants
+        .into_iter()
+        .map(|variant| {
+            let (named, fields) = read_fields(ident, variant.fields, default_field_type);
+            (variant.ident, named, fields)
+        })
+        .collect();
+
+    let mut delta_variants = Vec::new();
+    let mut diff_arms = Vec::new();
+    let mut apply_arms = Vec::new();
+
+    for (variant, named, fields) in &read {
+        if fields.is_empty() {
+            // Nothing to diff, and nothing to apply: two of these are equal by
+            // being the same variant.
+            let pattern = variant_pattern(&quote!(Self), variant, *named, fields, Some("old"));
+            diff_arms.push(quote!((#pattern, Self::#variant) => None,));
+            continue;
+        }
+
+        // Enum variant fields carry the enum's visibility, so unlike a struct's
+        // they must not be written `pub`.
+        let declared = delta_fields_inner(*named, false, fields.iter().cloned());
+        delta_variants.push(if *named {
+            quote!(#variant { #declared })
+        } else {
+            quote!(#variant(#declared))
+        });
+
+        let (compute_let, compute_fields) =
+            delta_compute_fields(*named, Source::Bound, fields.iter().cloned());
+        let old = variant_pattern(&quote!(Self), variant, *named, fields, Some("old"));
+        let new = variant_pattern(&quote!(Self), variant, *named, fields, Some("new"));
+        let init = if *named {
+            quote!(#delta_ident::#variant { #compute_fields })
+        } else {
+            quote!(#delta_ident::#variant(#compute_fields))
+        };
+        diff_arms.push(quote! {
+            (#old, #new) => {
+                let mut delta_is_some = false;
+                #compute_let
+                if delta_is_some {
+                    Some(::delta_struct::EnumDelta::Delta(#init))
+                } else {
+                    None
+                }
+            }
+        });
+
+        let (_, apply_actions) = delta_apply_fields(*named, Source::Bound, fields.iter().cloned());
+        let target = variant_pattern(&quote!(Self), variant, *named, fields, Some("self"));
+        let carried = variant_pattern(&quote!(#delta_ident), variant, *named, fields, None);
+        apply_arms.push(quote! {
+            (#target, #carried) => { #apply_actions }
+        });
+    }
+
+    // Both halves of a mismatch report a name, and both are found by matching
+    // — `{ .. }` fits every variant shape, so one arm per variant does it.
+    let source_names = read
+        .iter()
+        .map(|(variant, ..)| quote!(Self::#variant { .. } => stringify!(#variant),));
+    let delta_names = read
+        .iter()
+        .filter(|(_, _, fields)| !fields.is_empty())
+        .map(|(variant, ..)| quote!(#delta_ident::#variant { .. } => stringify!(#variant),));
+
+    Generated {
+        delta_type: quote! {
+            #delta_leader
+            #vis enum #delta_ident #generics #og_where_clause {
+                #(#delta_variants,)*
+            }
+        },
+        output_ty: quote! {
+            ::delta_struct::EnumDelta<#ident #ty_generics, #delta_ident #ty_generics>
+        },
+        delta_body: quote! {
+            #[allow(unreachable_patterns)] // A one-variant enum never `Became`.
+            match (old, new) {
+                #(#diff_arms)*
+                // Different variants: there is no difference to describe, only
+                // a replacement.
+                (_, new) => Some(::delta_struct::EnumDelta::Became(new)),
+            }
+        },
+        apply_body: quote! {
+            let delta = match delta {
+                ::delta_struct::EnumDelta::Became(new) => {
+                    *self = new;
+                    return Ok(());
+                }
+                ::delta_struct::EnumDelta::Delta(delta) => delta,
+            };
+            match (&mut *self, delta) {
+                #(#apply_arms)*
+                (found, mismatched) => {
+                    return Err(::delta_struct::Mismatch {
+                        type_name: stringify!(#ident),
+                        expected: match mismatched { #(#delta_names)* },
+                        found: match found { #(#source_names)* },
+                    });
+                }
+            }
+            Ok(())
+        },
+    }
+}
+
+/// The pattern that takes one variant apart, binding each field to a local.
+///
+/// `prefix` distinguishes the several copies of a variant that appear in one
+/// match — `old_`, `new_`, `self_` — or is [`None`] for the delta being
+/// consumed, whose fields bind to the bare local names the generated field
+/// code already refers to.
+fn variant_pattern(
+    path: &TokenStream2,
+    variant: &Ident,
+    named: bool,
+    fields: &[Field],
+    prefix: Option<&str>,
+) -> TokenStream2 {
+    if fields.is_empty() {
+        return quote!(#path::#variant);
+    }
+    let bindings = fields
+        .iter()
+        .map(|(og_ident, ..)| {
+            let local = local_ident(named, og_ident);
+            match prefix {
+                Some(prefix) => format_ident!("{}_{}", prefix, local),
+                None => local,
+            }
+        })
+        .collect::<Vec<_>>();
+    if named {
+        let names = fields
+            .iter()
+            .map(|(og_ident, ..)| format_ident!("{}", og_ident));
+        quote!(#path::#variant { #(#names: #bindings),* })
+    } else {
+        quote!(#path::#variant( #(#bindings),* ))
+    }
 }
 
 /// Emits the field declarations of the generated delta struct.
@@ -291,6 +562,19 @@ pub fn derive_delta(input: TokenStream) -> TokenStream {
 /// wrapped in braces or in parentheses: a tuple struct's delta is a tuple
 /// struct too, and its fields are positional rather than named.
 fn delta_fields(named: bool, iter: impl Iterator<Item = Field>) -> proc_macro2::TokenStream {
+    delta_fields_inner(named, true, iter)
+}
+
+/// The body of [`delta_fields`], with a say over `pub`.
+///
+/// A struct's delta fields are all `pub`; an enum variant's take the enum's
+/// visibility and may not be written `pub` at all.
+fn delta_fields_inner(
+    named: bool,
+    public: bool,
+    iter: impl Iterator<Item = Field>,
+) -> proc_macro2::TokenStream {
+    let vis = public.then(|| quote!(pub));
     FromIterator::from_iter(iter.map(|(ident, ty, field_ty, field_leader)| {
         let field_leader = proc_macro2::TokenStream::from_str(&field_leader).unwrap();
         let declared_ty = match field_ty {
@@ -298,7 +582,10 @@ fn delta_fields(named: bool, iter: impl Iterator<Item = Field>) -> proc_macro2::
                 quote!(::delta_struct::SeqDelta<<#ty as ::std::iter::IntoIterator>::Item>)
             }
             FieldType::Unordered => {
-                quote!(::delta_struct::BagDelta<<#ty as ::std::iter::IntoIterator>::Item>)
+                // Unlike the other collection field types this does not name a
+                // delta type directly: a set's membership diff and a map's are
+                // different shapes, and `Unordered` is what picks between them.
+                quote!(<#ty as ::delta_struct::Unordered>::Delta)
             }
             FieldType::UnorderedDelta => {
                 // The field's own type names the collection, not its key and
@@ -316,12 +603,12 @@ fn delta_fields(named: bool, iter: impl Iterator<Item = Field>) -> proc_macro2::
             let ident = format_ident!("{}", ident);
             quote! {
                 #field_leader
-                pub #ident: #declared_ty,
+                #vis #ident: #declared_ty,
             }
         } else {
             quote! {
                 #field_leader
-                pub #declared_ty,
+                #vis #declared_ty,
             }
         }
     }))
@@ -335,33 +622,43 @@ fn delta_fields(named: bool, iter: impl Iterator<Item = Field>) -> proc_macro2::
 /// [`delta_fields`].
 fn delta_compute_fields(
     named: bool,
+    source: Source,
     iter: impl Iterator<Item = Field>,
 ) -> (proc_macro2::TokenStream, proc_macro2::TokenStream) {
-    iter.map(|(og_ident, _ty, field_ty, _field_leader)| {
-        let ident = if named {
-            format_ident!("{}", og_ident)
-        } else {
-            format_ident!("field_{}", og_ident)
-        };
-        let og_ident: proc_macro2::TokenStream = FromStr::from_str(&og_ident).unwrap();
+    iter.map(|(og_ident, ty, field_ty, _field_leader)| {
+        let ident = local_ident(named, &og_ident);
+        let (old, new) = source.sides(&og_ident, &ident);
         let statements = match field_ty {
-            FieldType::Ordered | FieldType::Unordered | FieldType::UnorderedDelta => {
+            FieldType::Ordered | FieldType::UnorderedDelta => {
                 let module = collection_module(field_ty);
                 quote! {
-                    let #ident = ::delta_struct::#module::diff(old.#og_ident, new.#og_ident);
+                    let #ident = ::delta_struct::#module::diff(#old, #new);
                     delta_is_some = delta_is_some || !#ident.is_empty();
                 }
             }
+            // `Unordered::diff` reports "nothing changed" as `None` rather than
+            // as an empty delta, so this reads like the `Scalar` arm below
+            // rather than like the two collection modules above. The field
+            // still holds an empty delta, which is what `Default` supplies.
+            FieldType::Unordered => quote! {
+                let #ident = match <#ty as ::delta_struct::Unordered>::diff(#old, #new) {
+                    Some(v) => {
+                        delta_is_some = true;
+                        v
+                    }
+                    None => ::std::default::Default::default(),
+                };
+            },
             FieldType::Scalar => quote! {
-                let #ident = if old.#og_ident != new.#og_ident {
+                let #ident = if #old != #new {
                     delta_is_some = true;
-                    Some(new.#og_ident)
+                    Some(#new)
                 } else {
                     None
                 };
             },
             FieldType::Delta => quote! {
-                let #ident = Delta::delta(old.#og_ident, new.#og_ident);
+                let #ident = Delta::delta(#old, #new);
                 delta_is_some = delta_is_some || #ident.is_some();
             },
         };
@@ -381,30 +678,33 @@ fn delta_compute_fields(
 /// [`delta_fields`].
 fn delta_apply_fields(
     named: bool,
+    source: Source,
     iter: impl Iterator<Item = Field>,
 ) -> (proc_macro2::TokenStream, proc_macro2::TokenStream) {
-    iter.map(|(og_ident, _ty, field_ty, _field_leader)| {
-        let ident = if named {
-            format_ident!("{}", og_ident)
-        } else {
-            format_ident!("field_{}", og_ident)
-        };
-        let og_ident: proc_macro2::TokenStream = FromStr::from_str(&og_ident).unwrap();
+    iter.map(|(og_ident, ty, field_ty, _field_leader)| {
+        let ident = local_ident(named, &og_ident);
+        let target = source.target(&og_ident, &ident);
         let statements = match field_ty {
-            FieldType::Ordered | FieldType::Unordered | FieldType::UnorderedDelta => {
+            // `map::apply` is the one collection helper that can fail, because
+            // it is the one that recurses into `apply_delta`.
+            FieldType::Ordered | FieldType::UnorderedDelta => {
                 let module = collection_module(field_ty);
+                let question = (field_ty == FieldType::UnorderedDelta).then(|| quote!(?));
                 quote! {
-                    ::delta_struct::#module::apply(&mut self.#og_ident, #ident);
+                    ::delta_struct::#module::apply(&mut #target, #ident)#question;
                 }
             }
+            FieldType::Unordered => quote! {
+                <#ty as ::delta_struct::Unordered>::apply(&mut #target, #ident);
+            },
             FieldType::Scalar => quote! {
                 if let Some(v) = #ident {
-                    self.#og_ident = v;
+                    #target = v;
                 }
             },
             FieldType::Delta => quote! {
                 if let Some(v) = #ident {
-                    self.#og_ident.apply_delta(v);
+                    #target.apply_delta(v)?;
                 }
             },
         };
@@ -415,19 +715,82 @@ fn delta_apply_fields(
     .unzip()
 }
 
-/// The runtime module backing a collection field type.
+/// How generated code reaches the two sides of a field.
 ///
-/// The three collection field types differ in what their delta looks like, but
-/// not in how the derive drives one: each module pairs a `diff` and an `apply`
-/// over a delta type that reports whether it is empty. Panics for the two
-/// non-collection field types, which the callers never pass.
+/// A struct's impl holds whole values and reads through them. An enum's has
+/// taken its values apart in a match pattern, so the fields are already locals
+/// by the time the per-field code runs — and for `apply_delta` they are `&mut`
+/// locals, which is why [`Source::target`] dereferences them.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum Source {
+    /// Through the values themselves: `old.foo`, `new.foo`, `self.foo`.
+    Whole,
+    /// Through pattern bindings: `old_foo`, `new_foo`, `*self_foo`.
+    Bound,
+}
+
+impl Source {
+    /// The expressions naming a field's old and new values in `Delta::delta`.
+    fn sides(self, og_ident: &str, ident: &Ident) -> (TokenStream2, TokenStream2) {
+        match self {
+            Source::Whole => {
+                let og_ident = field_accessor(og_ident);
+                (quote!(old.#og_ident), quote!(new.#og_ident))
+            }
+            Source::Bound => {
+                let old = format_ident!("old_{}", ident);
+                let new = format_ident!("new_{}", ident);
+                (quote!(#old), quote!(#new))
+            }
+        }
+    }
+
+    /// The place expression a field is written back to in `apply_delta`.
+    fn target(self, og_ident: &str, ident: &Ident) -> TokenStream2 {
+        match self {
+            Source::Whole => {
+                let og_ident = field_accessor(og_ident);
+                quote!(self.#og_ident)
+            }
+            Source::Bound => {
+                let binding = format_ident!("self_{}", ident);
+                quote!((*#binding))
+            }
+        }
+    }
+}
+
+/// A source field's name as it is written after a `.` — its identifier, or the
+/// bare index of a tuple field.
+fn field_accessor(og_ident: &str) -> TokenStream2 {
+    FromStr::from_str(og_ident).unwrap()
+}
+
+/// The local a generated field binds to: its own name, or `field_0`,
+/// `field_1`, … where the source field is positional.
+fn local_ident(named: bool, og_ident: &str) -> Ident {
+    if named {
+        format_ident!("{}", og_ident)
+    } else {
+        format_ident!("field_{}", og_ident)
+    }
+}
+
+/// The runtime module backing a collection field type whose delta type is
+/// fixed by the field type alone.
+///
+/// These two differ in what their delta looks like but not in how the derive
+/// drives one: each module pairs a `diff` and an `apply` over a delta type
+/// that reports whether it is empty. `unordered` is not among them — its shape
+/// depends on the collection rather than the field type, so it goes through
+/// the `Unordered` trait instead. Panics for every field type the callers
+/// never pass.
 fn collection_module(field_ty: FieldType) -> Ident {
     match field_ty {
         FieldType::Ordered => format_ident!("seq"),
-        FieldType::Unordered => format_ident!("bag"),
         FieldType::UnorderedDelta => format_ident!("map"),
-        FieldType::Scalar | FieldType::Delta => {
-            unreachable!("{:?} is not a collection field type", field_ty)
+        FieldType::Unordered | FieldType::Scalar | FieldType::Delta => {
+            unreachable!("{:?} does not have a fixed collection module", field_ty)
         }
     }
 }

@@ -28,7 +28,7 @@
 //!
 //! // Applying the delta to an older copy brings it up to date.
 //! let mut current = Config { host: "localhost".to_string(), port: 80 };
-//! current.apply_delta(delta);
+//! current.apply_delta(delta).unwrap();
 //! assert_eq!(current.port, 8080);
 //! ```
 //!
@@ -39,6 +39,10 @@
 //! [`Delta::delta`] returns [`None`] when nothing changed, so
 //! `if let Some(delta) = Delta::delta(old, new)` is the usual way to skip
 //! sending an empty update.
+//!
+//! [`Delta::apply_delta`] returns a [`Result`], and the `unwrap` above is safe
+//! rather than lazy: a struct's delta always fits the struct, so only an enum
+//! can fail — see [`Mismatch`]. Use `?` wherever an enum is in reach.
 //!
 //! # Field types
 //!
@@ -54,9 +58,9 @@
 //!
 //! ## `unordered`
 //!
-//! The field is treated as a bag of elements whose order carries no meaning,
-//! so the delta records only which elements came and went: a [`BagDelta`],
-//! holding an `add` and a `remove`, both `Vec<Item>`.
+//! The field is treated as a collection whose order carries no meaning, so the
+//! delta records only which elements came and went. A set's answer to that is
+//! a [`BagDelta`], holding an `add` and a `remove`, both `Vec<Item>`.
 //!
 //! ```
 //! use delta_struct::Delta;
@@ -77,18 +81,70 @@
 //! assert_eq!(delta.services.remove, vec!["ssh".to_string()]);
 //! ```
 //!
-//! The field has to be a **set** — a [`HashSet`](std::collections::HashSet) or
-//! a [`BTreeSet`](std::collections::BTreeSet). Formally it needs [`Extend`]
-//! and [`TryIndex`], this crate's fallible answer to
-//! [`Index`](std::ops::Index); the two std sets implement it, and you can
-//! implement it for your own collection. A [`Vec`] deliberately does not
-//! qualify — see [Limitations](#limitations).
+//! The field has to be a **set or a map** — a
+//! [`HashSet`](std::collections::HashSet), a
+//! [`BTreeSet`](std::collections::BTreeSet), a
+//! [`HashMap`](std::collections::HashMap), or a
+//! [`BTreeMap`](std::collections::BTreeMap). Formally it needs [`Unordered`],
+//! which all four implement and which you can implement for your own
+//! collection. A [`Vec`] deliberately does not qualify — see
+//! [Limitations](#limitations).
 //!
 //! Every element of the old collection is looked up in the new one exactly
 //! once, so the cost of a diff is the cost of n lookups in whichever
-//! collection you picked: **O(n)** for a `HashSet`, O(n log n) for a
-//! `BTreeSet`. Applying one costs the same, since each removal is a lookup
-//! rather than a rebuild.
+//! collection you picked: **O(n)** for a `HashSet` or `HashMap`, O(n log n)
+//! for a `BTreeSet` or `BTreeMap`. Applying one costs the same, since each
+//! removal is a lookup rather than a rebuild.
+//!
+//! ### A map's membership diff is a different shape
+//!
+//! A map is a collection of entries, but one with a rule a set has no
+//! equivalent of: no two entries share a key. That rule earns a smaller delta,
+//! so a map field's is an [`EntryDelta`] rather than a [`BagDelta`] — `add`
+//! carries whole entries because the receiver needs to be told the value,
+//! while `remove` carries **bare keys**, since a key names an entry on its
+//! own.
+//!
+//! ```
+//! use delta_struct::Delta;
+//! use std::collections::BTreeMap;
+//!
+//! #[derive(Delta)]
+//! struct Deployment {
+//!     #[delta_struct(field_type = "unordered")]
+//!     labels: BTreeMap<String, String>,
+//! }
+//!
+//! let deployment = |labels: &[(&str, &str)]| Deployment {
+//!     labels: labels.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+//! };
+//!
+//! let delta = Delta::delta(
+//!     deployment(&[("tier", "web"), ("zone", "a")]),
+//!     deployment(&[("tier", "edge")]),
+//! )
+//! .unwrap();
+//! // `tier` survived, so only what it holds now travels — the old value stays
+//! // where it already is. `zone` left, and its key alone says so.
+//! assert_eq!(delta.labels.add, vec![("tier".to_string(), "edge".to_string())]);
+//! assert_eq!(delta.labels.remove, vec!["zone".to_string()]);
+//! ```
+//!
+//! A key that survived with a new value is an *addition*, not a removal
+//! followed by one: applying an addition overwrites whatever the key held, so
+//! the removal would say nothing the addition does not already say.
+//!
+//! Which shape a field gets is the collection's business, not the field type's
+//! — the delta field is declared as `<T as Unordered>::Delta`, and the
+//! collection's [`Unordered`] impl picks. That is what lets one field type
+//! cover both without the derive needing to tell a map from a set.
+//!
+//! This — not `unordered-delta` — is what to reach for when the values are
+//! scalars with no [`Delta`] impl of their own, which is the usual shape of a
+//! map of labels, tags, or config. The trade against `unordered-delta` is that
+//! a changed value travels whole rather than as its own delta; in exchange
+//! this asks nothing of the value type but [`PartialEq`], and needs only
+//! [`TryIndex`] where `unordered-delta` needs [`TryIndexMut`].
 //!
 //! `apply_delta` preserves membership but not position — additions land
 //! wherever the collection decides to put them. Use `ordered` where that
@@ -218,6 +274,71 @@
 //! assert_eq!(inner_delta.b, Some(3));
 //! ```
 //!
+//! # Enums
+//!
+//! An enum can change in two ways a struct cannot, and its delta says which.
+//! Two values in the *same* variant are diffed field by field exactly as a
+//! struct is. Two values in *different* variants have no difference to
+//! describe — the new one shares nothing with the old — so the whole value
+//! travels.
+//!
+//! That fork is [`EnumDelta`], and `Output` becomes
+//! `EnumDelta<Self, {Self}Delta>` rather than the bare companion type. The
+//! generated `{Self}Delta` carries one variant per *diffable* source variant;
+//! a field-less variant gets none, since two of those can never differ.
+//!
+//! ```
+//! use delta_struct::{Delta, EnumDelta};
+//!
+//! #[derive(Delta)]
+//! #[delta_struct(delta_leader = "#[derive(Debug)]")]
+//! enum Shape {
+//!     Empty,
+//!     Circle { r: u32 },
+//! }
+//!
+//! // Same variant: only the field that moved travels.
+//! let delta = Delta::delta(Shape::Circle { r: 1 }, Shape::Circle { r: 2 }).unwrap();
+//! match delta {
+//!     EnumDelta::Delta(ShapeDelta::Circle { r }) => assert_eq!(r, Some(2)),
+//!     _ => panic!("same variant"),
+//! }
+//!
+//! // Different variant: a replacement, not a difference.
+//! let delta = Delta::delta(Shape::Empty, Shape::Circle { r: 3 }).unwrap();
+//! assert!(matches!(delta, EnumDelta::Became(Shape::Circle { r: 3 })));
+//! ```
+//!
+//! Keeping `Became` on a crate type rather than as an arm of the generated
+//! enum is what lets you have a variant of your own called `Became`.
+//!
+//! ## Why `apply_delta` returns a `Result`
+//!
+//! A delta built while a value was one variant can arrive at a value that is
+//! now another. That is divergence, and it is the one thing applying a delta
+//! can genuinely fail at — hence [`Mismatch`], which names the type, the
+//! variant the delta expected, and the variant it found.
+//!
+//! ```
+//! # use delta_struct::{Delta, Mismatch};
+//! # #[derive(Delta)]
+//! # enum Shape { Empty, Circle { r: u32 } }
+//! let delta = Delta::delta(Shape::Circle { r: 1 }, Shape::Circle { r: 2 }).unwrap();
+//! let mut diverged = Shape::Empty;
+//! assert_eq!(
+//!     diverged.apply_delta(delta),
+//!     Err(Mismatch { type_name: "Shape", expected: "Circle", found: "Empty" }),
+//! );
+//! ```
+//!
+//! Nested deltas propagate the innermost mismatch rather than wrapping it, so
+//! what you get names the enum that actually disagreed rather than the
+//! outermost struct you called `apply_delta` on.
+//!
+//! Only enums can produce this. A struct's `apply_delta` returns `Ok` unless
+//! one of its fields is an enum, which is why the `unwrap`s in the struct
+//! examples above are safe rather than sloppy.
+//!
 //! # Container attributes
 //!
 //! `#[delta_struct(...)]` on the struct itself accepts:
@@ -291,7 +412,7 @@
 //!
 //! // Receiver applies it to whatever it already had.
 //! let mut config = Config { host: "localhost".to_string(), port: 80 };
-//! config.apply_delta(serde_json::from_str::<ConfigDelta>(&payload.unwrap()).unwrap());
+//! config.apply_delta(serde_json::from_str::<ConfigDelta>(&payload.unwrap()).unwrap()).unwrap();
 //! assert_eq!(config.port, 8080);
 //! ```
 //!
@@ -330,7 +451,7 @@
 //! belong.
 //!
 //! ```
-//! use delta_struct::{Applied, Delta, Fingerprint, Mismatch, Versioned};
+//! use delta_struct::{Applied, Delta, Fingerprint, Rejected, Versioned};
 //!
 //! #[derive(Clone, Debug, Delta, Fingerprint, PartialEq)]
 //! #[delta_struct(delta_leader = "#[derive(Clone)]")]
@@ -357,7 +478,7 @@
 //! // half-applied.
 //! let mut stranger = Versioned::new(config(80));
 //! let orphan = Versioned::new(config(1)).commit(config(2)).unwrap();
-//! assert!(matches!(stranger.apply(orphan), Err(Mismatch::Base { .. })));
+//! assert!(matches!(stranger.apply(orphan), Err(Rejected::Base { .. })));
 //! ```
 //!
 //! Every [`VersionedDelta`] carries four numbers, each catching a failure the
@@ -371,7 +492,7 @@
 //!
 //! A rejected delta leaves the receiver untouched and its version unmoved, so
 //! a later delta in the same stream fails too rather than papering over the
-//! hole. The answer to any [`Mismatch`] is to resend the whole [`Versioned`],
+//! hole. The answer to any [`Rejected`] is to resend the whole [`Versioned`],
 //! which serializes as a unit and carries the version the receiver resumes
 //! from.
 //!
@@ -424,8 +545,11 @@
 //!
 //! # Limitations
 //!
-//! - **Structs only.** Enums and unions are rejected; there is no obvious
-//!   delta for a value that changed variant.
+//! - **Unions are rejected.** Structs and enums are both supported; a union
+//!   has no way to say which of its fields is live, so there is nothing to
+//!   diff.
+//! - **An enum with no variants is rejected.** An uninhabited type has no two
+//!   values that could differ.
 //! - **Every type parameter gets a `PartialEq` bound** on the generated impl,
 //!   whether or not the field that uses it needs one.
 //! - **A unit struct's delta is always [`None`]**, as is that of a struct with
@@ -454,19 +578,25 @@
 extern crate self as delta_struct;
 
 pub mod bag;
+pub mod entry;
 pub mod fingerprint;
 pub mod index;
 pub mod map;
 pub mod seq;
+pub mod unordered;
+pub mod variant;
 pub mod version;
 
 pub use bag::BagDelta;
 pub use delta_struct_macros::{Delta, Fingerprint};
+pub use entry::EntryDelta;
 pub use fingerprint::{fingerprint_of, Fingerprint};
 pub use index::{TryIndex, TryIndexMut};
 pub use map::{KeyedDelta, MapDelta, MapEntry};
 pub use seq::{SeqDelta, Splice};
-pub use version::{Applied, Mismatch, Versioned, VersionedDelta};
+pub use unordered::Unordered;
+pub use variant::{EnumDelta, Mismatch};
+pub use version::{Applied, Rejected, Versioned, VersionedDelta};
 
 /// Computing the difference between two values, and applying it to a third.
 ///
@@ -478,7 +608,9 @@ pub use version::{Applied, Mismatch, Versioned, VersionedDelta};
 pub trait Delta {
     /// The type describing a difference between two `Self` values.
     ///
-    /// The derive sets this to the generated `{Self}Delta` struct.
+    /// The derive sets this to the generated `{Self}Delta` struct — or, for an
+    /// enum, to [`EnumDelta<Self, {Self}Delta>`](EnumDelta), since a value can
+    /// change variant as well as change within one.
     type Output;
 
     /// Computes what it would take to turn `old` into `new`.
@@ -493,7 +625,16 @@ pub trait Delta {
     /// Applying the delta from `delta(old, new)` to a value equal to `old`
     /// yields a value equal to `new` — with the caveat that `unordered` fields
     /// preserve membership rather than order.
-    fn apply_delta(&mut self, delta: Self::Output);
+    ///
+    /// Fails only when the delta cannot fit the value, which only an enum can
+    /// manage: a delta built for one variant, applied to a value now in
+    /// another. See [`Mismatch`]. For a struct — and for an enum in the
+    /// variant its delta expects — this always returns `Ok`.
+    ///
+    /// A failure leaves the value partly updated, so treat it the way
+    /// [`Versioned`] does: the value is no longer trustworthy and wants
+    /// replacing wholesale, not patching again.
+    fn apply_delta(&mut self, delta: Self::Output) -> Result<(), Mismatch>;
 }
 #[cfg(test)]
 mod tests {
@@ -563,7 +704,7 @@ mod tests {
         assert_eq!(delta.3, Some(true));
 
         let mut applied = old;
-        applied.apply_delta(delta);
+        applied.apply_delta(delta).unwrap();
         assert_eq!(applied, new);
     }
 
@@ -711,7 +852,7 @@ mod tests {
         for (old, new) in cases {
             let mut applied = tags(old);
             let delta = Delta::delta(tags(old), tags(new)).unwrap();
-            applied.apply_delta(delta);
+            applied.apply_delta(delta).unwrap();
             assert_eq!(applied, tags(new), "{:?} -> {:?}", old, new);
         }
     }
@@ -732,8 +873,12 @@ mod tests {
             unordered: vec![2, 3].into_iter().collect(),
         };
         let mut applied = old.clone();
-        applied.apply_delta(Delta::delta(old.clone(), new.clone()).unwrap());
-        applied.apply_delta(Delta::delta(old, new.clone()).unwrap());
+        applied
+            .apply_delta(Delta::delta(old.clone(), new.clone()).unwrap())
+            .unwrap();
+        applied
+            .apply_delta(Delta::delta(old, new.clone()).unwrap())
+            .unwrap();
         assert_eq!(applied, new);
     }
 
@@ -875,7 +1020,7 @@ mod tests {
         for (old, new) in cases {
             let mut applied = playlist(old, true);
             let delta = Delta::delta(playlist(old, false), playlist(new, true)).unwrap();
-            applied.apply_delta(delta);
+            applied.apply_delta(delta).unwrap();
             assert_eq!(applied, playlist(new, true), "{:?} -> {:?}", old, new);
         }
     }
@@ -928,6 +1073,14 @@ mod tests {
     struct Cluster {
         #[delta_struct(field_type = "unordered-delta")]
         services: HashMap<String, Service>,
+        region: String,
+    }
+
+    #[derive(Clone, Debug, Delta, PartialEq)]
+    #[delta_struct(delta_leader = "#[derive(Clone, Debug)]")]
+    struct ClusterNoDelta {
+        #[delta_struct(field_type = "unordered")]
+        services: HashMap<String, String>,
         region: String,
     }
 
@@ -1039,7 +1192,7 @@ mod tests {
         for (old, new) in cases {
             let mut applied = cluster(old, "us");
             let delta = Delta::delta(cluster(old, "us"), cluster(new, "eu")).unwrap();
-            applied.apply_delta(delta);
+            applied.apply_delta(delta).unwrap();
             assert_eq!(applied, cluster(new, "eu"), "{:?} -> {:?}", old, new);
         }
     }
@@ -1064,8 +1217,202 @@ mod tests {
         assert_eq!(delta.entries.add, vec![(3, NewType(30))]);
         assert_eq!(delta.entries.remove, vec![1]);
         assert_eq!(delta.entries.change.len(), 1);
-        applied.apply_delta(delta);
+        applied.apply_delta(delta).unwrap();
         assert_eq!(applied, pairs(&[(2, 21), (3, 30)]));
+    }
+
+    /// A `ClusterNoDelta`'s services in the compact `(name, image)` form the
+    /// tests below are written in.
+    type Images<'a> = &'a [(&'a str, &'a str)];
+
+    fn cluster_no_delta(services: Images, region: &str) -> ClusterNoDelta {
+        ClusterNoDelta {
+            services: services
+                .iter()
+                .map(|(name, image)| (name.to_string(), image.to_string()))
+                .collect(),
+            region: region.to_string(),
+        }
+    }
+
+    /// A `HashMap` iterates in whatever order it likes, so an `EntryDelta`
+    /// over one has to be sorted before it can be compared.
+    fn sorted<T: Ord>(mut entries: Vec<T>) -> Vec<T> {
+        entries.sort();
+        entries
+    }
+
+    #[test]
+    fn unordered_over_a_map_sends_one_copy_of_a_changed_value() {
+        // The case the field type exists for: `String` has no `Delta` impl, so
+        // `unordered-delta` is out and membership is all there is to diff. The
+        // key survived, so only what it holds now travels — the receiver
+        // already has the old value and is never sent it back.
+        let delta = Delta::delta(
+            cluster_no_delta(&[("web", "nginx:1"), ("db", "pg:14")], "us"),
+            cluster_no_delta(&[("web", "nginx:2"), ("db", "pg:14")], "us"),
+        )
+        .unwrap();
+        assert_eq!(
+            sorted(delta.services.add),
+            vec![("web".to_string(), "nginx:2".to_string())]
+        );
+        assert!(delta.services.remove.is_empty());
+        // `db` sat still on both sides, and so did the region.
+        assert_eq!(delta.region, None);
+    }
+
+    #[test]
+    fn unordered_over_a_map_removes_by_bare_key() {
+        let delta = Delta::delta(
+            cluster_no_delta(&[("web", "nginx:1"), ("db", "pg:14")], "us"),
+            cluster_no_delta(&[("db", "pg:14")], "us"),
+        )
+        .unwrap();
+        assert!(delta.services.add.is_empty());
+        assert_eq!(delta.services.remove, vec!["web".to_string()]);
+    }
+
+    #[test]
+    fn unordered_over_a_map_false_positive_check() {
+        let delta = Delta::delta(
+            cluster_no_delta(&[("web", "nginx:1"), ("db", "pg:14")], "us"),
+            cluster_no_delta(&[("db", "pg:14"), ("web", "nginx:1")], "us"),
+        );
+        assert!(delta.is_none());
+    }
+
+    #[test]
+    fn unordered_over_a_map_apply_round_trips() {
+        let cases: &[(Images, Images)] = &[
+            // A value changed under a stable key.
+            (&[("web", "nginx:1")], &[("web", "nginx:2")]),
+            // Pure addition, pure removal, and both at once.
+            (
+                &[("web", "nginx:1")],
+                &[("web", "nginx:1"), ("db", "pg:14")],
+            ),
+            (
+                &[("web", "nginx:1"), ("db", "pg:14")],
+                &[("web", "nginx:1")],
+            ),
+            (&[("web", "nginx:1")], &[("db", "pg:14")]),
+            // Every kind of change in one go.
+            (
+                &[("web", "nginx:1"), ("db", "pg:14"), ("gone", "x:1")],
+                &[("web", "nginx:2"), ("db", "pg:14"), ("new", "y:1")],
+            ),
+            (&[], &[("web", "nginx:1")]),
+            (&[("web", "nginx:1")], &[]),
+        ];
+        for (old, new) in cases {
+            let mut applied = cluster_no_delta(old, "us");
+            let delta =
+                Delta::delta(cluster_no_delta(old, "us"), cluster_no_delta(new, "eu")).unwrap();
+            applied.apply_delta(delta).unwrap();
+            assert_eq!(
+                applied,
+                cluster_no_delta(new, "eu"),
+                "{:?} -> {:?}",
+                old,
+                new
+            );
+        }
+    }
+
+    #[test]
+    fn unordered_over_a_map_apply_ignores_absent_removals() {
+        // Same tolerance the set case has: applying twice is harmless, since
+        // the second removal finds nothing and the second addition overwrites
+        // with what is already there.
+        let delta = Delta::delta(
+            cluster_no_delta(&[("web", "nginx:1"), ("db", "pg:14")], "us"),
+            cluster_no_delta(&[("web", "nginx:2")], "us"),
+        )
+        .unwrap();
+        let mut applied = cluster_no_delta(&[("web", "nginx:1"), ("db", "pg:14")], "us");
+        applied.apply_delta(delta.clone()).unwrap();
+        applied.apply_delta(delta).unwrap();
+        assert_eq!(applied, cluster_no_delta(&[("web", "nginx:2")], "us"));
+    }
+
+    #[test]
+    fn unordered_over_a_btree_map() {
+        // The field need not be a `HashMap`: any map with an `Unordered` impl
+        // works, and a `BTreeMap`'s ordering makes the two lists
+        // deterministic.
+        #[derive(Clone, Debug, Delta, PartialEq)]
+        struct Labels {
+            #[delta_struct(field_type = "unordered")]
+            entries: BTreeMap<u8, char>,
+        }
+
+        let labels = |entries: &[(u8, char)]| Labels {
+            entries: entries.iter().copied().collect(),
+        };
+
+        let mut applied = labels(&[(1, 'a'), (2, 'b')]);
+        let delta =
+            Delta::delta(labels(&[(1, 'a'), (2, 'b')]), labels(&[(2, 'c'), (3, 'd')])).unwrap();
+        // `2` changed and `3` arrived; both are additions, because applying
+        // either means the same thing to a map.
+        assert_eq!(delta.entries.add, vec![(2, 'c'), (3, 'd')]);
+        assert_eq!(delta.entries.remove, vec![1]);
+        applied.apply_delta(delta).unwrap();
+        assert_eq!(applied, labels(&[(2, 'c'), (3, 'd')]));
+    }
+
+    #[test]
+    fn unordered_over_a_map_with_generics() {
+        // The delta field is spelled `<HashMap<K, V> as Unordered>::Delta`, so
+        // the generated struct only holds together when the projection
+        // resolves through the source type's own bounds.
+        #[derive(Clone, Debug, Delta, PartialEq)]
+        #[delta_struct(delta_leader = "#[derive(Debug, PartialEq)]")]
+        struct Tagged<K: std::hash::Hash + Eq, V: PartialEq> {
+            #[delta_struct(field_type = "unordered")]
+            tags: HashMap<K, V>,
+        }
+
+        let tagged = |v: u8| Tagged {
+            tags: vec![("a", v)].into_iter().collect::<HashMap<&str, u8>>(),
+        };
+
+        let delta = Delta::delta(tagged(1), tagged(2)).unwrap();
+        assert_eq!(
+            delta.tags,
+            EntryDelta {
+                add: vec![("a", 2)],
+                remove: vec![]
+            }
+        );
+
+        let mut applied = tagged(1);
+        applied.apply_delta(delta).unwrap();
+        assert_eq!(applied, tagged(2));
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn unordered_over_a_map_serializes() {
+        #[derive(Delta)]
+        #[delta_struct(delta_leader = "#[derive(serde::Serialize)]")]
+        struct Labels {
+            #[delta_struct(field_type = "unordered")]
+            entries: BTreeMap<String, String>,
+        }
+
+        let labels = |image: &str| Labels {
+            entries: vec![("web".to_string(), image.to_string())]
+                .into_iter()
+                .collect(),
+        };
+
+        let delta = Delta::delta(labels("nginx:1"), labels("nginx:2")).unwrap();
+        assert_eq!(
+            serde_json::to_string(&delta).unwrap(),
+            r#"{"entries":{"add":[["web","nginx:2"]],"remove":[]}}"#
+        );
     }
 
     #[cfg(feature = "serde")]
@@ -1211,7 +1558,7 @@ mod tests {
 
         assert_eq!(
             receiver.apply(second),
-            Err(Mismatch::Gap {
+            Err(Rejected::Gap {
                 expected: 0,
                 found: 1
             })
@@ -1230,7 +1577,7 @@ mod tests {
 
         let message = sender.commit(tracked("a", &["x", "y"], 2)).unwrap();
         match receiver.apply(message) {
-            Err(Mismatch::Base { expected, found }) => assert_ne!(expected, found),
+            Err(Rejected::Base { expected, found }) => assert_ne!(expected, found),
             other => panic!("expected a base mismatch, got {:?}", other),
         }
         assert_eq!(receiver.version(), 0);
@@ -1262,7 +1609,7 @@ mod tests {
         message.result ^= 1;
 
         match receiver.apply(message) {
-            Err(Mismatch::Result { expected, found }) => assert_ne!(expected, found),
+            Err(Rejected::Result { expected, found }) => assert_ne!(expected, found),
             other => panic!("expected a result mismatch, got {:?}", other),
         }
         // Version not advanced, so the corruption cannot be mistaken for
@@ -1287,6 +1634,210 @@ mod tests {
         let message: VersionedDelta<ConfigDelta> = serde_json::from_str(&payload).unwrap();
         assert_eq!(receiver.apply(message), Ok(Applied::Updated));
         assert_eq!(receiver.get().port, 8080);
+    }
+
+    // `ShapeDelta` holds a `BagDelta`, which is only `Serialize` when the
+    // crate's `serde` feature is on — so the serde half of this has to be
+    // conditional, unlike the plain-`Option` deltas elsewhere in these tests.
+    #[derive(Clone, Debug, Delta, Fingerprint, PartialEq)]
+    #[cfg_attr(feature = "serde", derive(serde::Serialize))]
+    #[cfg_attr(
+        feature = "serde",
+        delta_struct(delta_leader = "#[derive(Clone, Debug, PartialEq, serde::Serialize)]")
+    )]
+    #[cfg_attr(
+        not(feature = "serde"),
+        delta_struct(delta_leader = "#[derive(Clone, Debug, PartialEq)]")
+    )]
+    enum Shape {
+        Empty,
+        Circle(u32),
+        Rect {
+            w: u32,
+            h: u32,
+            #[delta_struct(field_type = "unordered")]
+            tags: BTreeSet<String>,
+        },
+    }
+
+    fn rect(w: u32, h: u32, tags: &[&str]) -> Shape {
+        Shape::Rect {
+            w,
+            h,
+            tags: tags.iter().map(|t| t.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn enum_diffs_within_a_variant() {
+        let delta = Delta::delta(rect(1, 2, &["a"]), rect(1, 3, &["a", "b"])).unwrap();
+        match delta {
+            EnumDelta::Delta(ShapeDelta::Rect { w, h, tags }) => {
+                assert_eq!(w, None); // unchanged, so it does not travel
+                assert_eq!(h, Some(3));
+                assert_eq!(tags.add, vec!["b".to_string()]);
+                assert!(tags.remove.is_empty());
+            }
+            other => panic!("expected a same-variant delta, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn enum_replaces_across_variants() {
+        let delta = Delta::delta(Shape::Circle(1), rect(1, 2, &[])).unwrap();
+        assert_eq!(delta, EnumDelta::Became(rect(1, 2, &[])));
+
+        // A unit variant on either side is still just a replacement.
+        let delta = Delta::delta(Shape::Empty, Shape::Circle(9)).unwrap();
+        assert_eq!(delta, EnumDelta::Became(Shape::Circle(9)));
+    }
+
+    #[test]
+    fn enum_false_positive_check() {
+        assert!(Delta::delta(Shape::Empty, Shape::Empty).is_none());
+        assert!(Delta::delta(Shape::Circle(1), Shape::Circle(1)).is_none());
+        assert!(Delta::delta(rect(1, 2, &["a"]), rect(1, 2, &["a"])).is_none());
+    }
+
+    #[test]
+    fn enum_apply_round_trips() {
+        let cases: &[(Shape, Shape)] = &[
+            (Shape::Circle(1), Shape::Circle(2)),
+            (rect(1, 2, &["a"]), rect(9, 2, &["b"])),
+            (Shape::Empty, Shape::Circle(3)),
+            (Shape::Circle(3), Shape::Empty),
+            (rect(1, 2, &[]), Shape::Circle(4)),
+            (Shape::Circle(4), rect(5, 6, &["x", "y"])),
+        ];
+        for (old, new) in cases {
+            let mut applied = old.clone();
+            let delta = Delta::delta(old.clone(), new.clone()).unwrap();
+            applied.apply_delta(delta).unwrap();
+            assert_eq!(&applied, new, "{:?} -> {:?}", old, new);
+        }
+    }
+
+    #[test]
+    fn enum_apply_reports_the_wrong_variant() {
+        // The failure structs cannot have: a delta built while the value was a
+        // `Rect`, applied to a value that is now a `Circle`.
+        let delta = Delta::delta(rect(1, 2, &[]), rect(1, 3, &[])).unwrap();
+        let mut diverged = Shape::Circle(7);
+        assert_eq!(
+            diverged.apply_delta(delta),
+            Err(Mismatch {
+                type_name: "Shape",
+                expected: "Rect",
+                found: "Circle",
+            })
+        );
+        // Nothing was touched on the way to noticing.
+        assert_eq!(diverged, Shape::Circle(7));
+    }
+
+    #[test]
+    fn enum_mismatch_propagates_through_a_struct() {
+        #[derive(Clone, Debug, Delta, PartialEq)]
+        struct Canvas {
+            #[delta_struct(field_type = "delta")]
+            shape: Shape,
+            name: String,
+        }
+
+        let canvas = |shape: Shape, name: &str| Canvas {
+            shape,
+            name: name.to_string(),
+        };
+        let delta =
+            Delta::delta(canvas(rect(1, 2, &[]), "a"), canvas(rect(1, 3, &[]), "b")).unwrap();
+
+        let mut diverged = canvas(Shape::Empty, "a");
+        // The innermost mismatch is what surfaces, not a wrapper naming
+        // `Canvas`.
+        assert_eq!(
+            diverged.apply_delta(delta),
+            Err(Mismatch {
+                type_name: "Shape",
+                expected: "Rect",
+                found: "Empty",
+            })
+        );
+    }
+
+    #[test]
+    fn enum_of_only_unit_variants() {
+        // Nothing is diffable, so the companion enum is uninhabited and every
+        // change is a replacement. It still has to compile and work.
+        #[derive(Clone, Debug, Delta, PartialEq)]
+        enum Flag {
+            On,
+            Off,
+        }
+
+        assert!(Delta::delta(Flag::On, Flag::On).is_none());
+        let mut applied = Flag::On;
+        applied
+            .apply_delta(Delta::delta(Flag::On, Flag::Off).unwrap())
+            .unwrap();
+        assert_eq!(applied, Flag::Off);
+    }
+
+    #[test]
+    fn enum_with_generics() {
+        #[derive(Clone, Debug, Delta, PartialEq)]
+        #[delta_struct(delta_leader = "#[derive(Debug, PartialEq)]")]
+        #[allow(dead_code)] // `Empty` is here to be the non-diffable variant.
+        enum Slot<T>
+        where
+            T: Clone,
+        {
+            Filled(T),
+            Empty,
+        }
+
+        let delta = Delta::delta(Slot::Filled(1), Slot::Filled(2)).unwrap();
+        assert_eq!(delta, EnumDelta::Delta(SlotDelta::Filled(Some(2))));
+
+        let mut applied = Slot::Filled(1);
+        applied.apply_delta(delta).unwrap();
+        assert_eq!(applied, Slot::Filled(2));
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn enum_delta_serializes() {
+        let delta = Delta::delta(Shape::Circle(1), Shape::Circle(2)).unwrap();
+        assert_eq!(
+            serde_json::to_string(&delta).unwrap(),
+            r#"{"Delta":{"Circle":2}}"#
+        );
+        // `Became` carries the source enum whole, which is why serializing an
+        // enum's delta needs the enum itself to be serializable.
+        let delta = Delta::delta(Shape::Empty, Shape::Circle(2)).unwrap();
+        assert_eq!(
+            serde_json::to_string(&delta).unwrap(),
+            r#"{"Became":{"Circle":2}}"#
+        );
+    }
+
+    #[test]
+    fn enum_inside_versioned() {
+        let mut sender = Versioned::new(rect(1, 2, &["a"]));
+        let mut receiver = Versioned::new(rect(1, 2, &["a"]));
+        let message = sender.commit(rect(1, 3, &["a"])).unwrap();
+        assert_eq!(receiver.apply(message), Ok(Applied::Updated));
+        assert_eq!(receiver.get(), sender.get());
+
+        // A receiver at the right version but in the wrong variant is caught
+        // by the base fingerprint before `apply_delta` is ever reached, so it
+        // is a `Base`, not an `Apply`.
+        let mut fresh = Versioned::new(rect(1, 2, &["a"]));
+        let mut diverged = Versioned::new(Shape::Circle(7));
+        let message = fresh.commit(rect(1, 4, &["a"])).unwrap();
+        assert!(matches!(
+            diverged.apply(message),
+            Err(Rejected::Base { .. })
+        ));
     }
 
     #[test]
@@ -1323,7 +1874,7 @@ mod tests {
             WhereClauseDeltaField { foo: NewType(2) },
         )
         .unwrap();
-        applied.apply_delta(delta);
+        applied.apply_delta(delta).unwrap();
         assert_eq!(applied.foo, NewType(2));
     }
 
@@ -1342,7 +1893,7 @@ mod tests {
         let new_clone = new.clone();
         let mut old_delta_applied = old.clone();
         let delta = Delta::delta(old, new);
-        old_delta_applied.apply_delta(delta.unwrap());
+        old_delta_applied.apply_delta(delta.unwrap()).unwrap();
         assert_eq!(new_clone, old_delta_applied);
     }
 }

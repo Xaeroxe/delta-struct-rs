@@ -14,7 +14,7 @@ This can be combined with `serde` to only transmit changes to structures, when u
 
 ```toml
 [dependencies]
-delta-struct = "0.3"
+delta-struct = "0.4"
 ```
 
 ## Usage
@@ -40,7 +40,7 @@ assert_eq!(delta.port, Some(8080));
 
 // Applying the delta to an older copy brings it up to date.
 let mut current = Config { host: "localhost".to_string(), port: 80 };
-current.apply_delta(delta);
+current.apply_delta(delta).unwrap();
 assert_eq!(current.port, 8080);
 ```
 
@@ -53,10 +53,12 @@ Each field is diffed according to a *field type*, set with `#[delta_struct(field
 | Value | Delta representation | Notes |
 | --- | --- | --- |
 | `"scalar"` (default) | `Option<T>` | `Some(new)` when the values differ. |
-| `"unordered"` | `BagDelta<Item>`, an `add` and a `remove` | For a **set** whose order carries no meaning. |
+| `"unordered"` | `<T as Unordered>::Delta` — a `BagDelta<Item>` for a set, an `EntryDelta<K, V>` for a map | For a **set or map** whose order carries no meaning. |
 | `"unordered-delta"` | `MapDelta<K, V, D>`, an `add`, a `remove`, and a `change` | For a **map**: values under a surviving key are diffed rather than resent. |
 | `"ordered"` | `SeqDelta<Item>`, a Myers edit script | For a sequence where position matters — the one field type that takes a `Vec`. Items need `Hash + Eq`. |
 | `"delta"` | `Option<<T as Delta>::Output>` | Diffs the field recursively; the field's type must derive `Delta` too. |
+
+`apply_delta` returns `Result<(), Mismatch>`. Only an enum can fail — a struct's delta always fits the struct — so the `unwrap` above is safe rather than lazy.
 
 `#[delta_struct(default = "...")]` on the struct changes the default for its fields. `BagDelta`, `MapDelta`, and `SeqDelta` are types from this crate, so enable the `serde` feature to serialize a delta struct holding any of them.
 
@@ -83,6 +85,35 @@ assert_eq!(delta.online, Some(true));
 ```
 
 Both `unordered` field types diff through `TryIndex`, this crate's fallible answer to `std::ops::Index`, so each element is looked up once instead of scanned for. The cost of a diff is the cost of the collection you picked: **O(n)** for a `HashSet`/`HashMap`, O(n log n) for a `BTreeSet`/`BTreeMap`. `Vec` is deliberately not supported here — implementing `TryIndex` for it would only hide a quadratic scan behind an O(1)-looking call.
+
+A map is an `unordered` field too, and this — not `unordered-delta` — is what to reach for when the values are scalars with no `Delta` impl of their own, as a map of labels, tags, or config usually is. A map's delta is a different shape from a set's, because a map has a rule a set has no equivalent of: no two entries share a key. So `add` carries whole entries, but `remove` carries **bare keys**:
+
+```rust
+use delta_struct::Delta;
+use std::collections::BTreeMap;
+
+#[derive(Delta)]
+struct Deployment {
+    #[delta_struct(field_type = "unordered")]
+    labels: BTreeMap<String, String>,
+}
+
+let deployment = |labels: &[(&str, &str)]| Deployment {
+    labels: labels.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+};
+
+let delta = Delta::delta(
+    deployment(&[("tier", "web"), ("zone", "a")]),
+    deployment(&[("tier", "edge")]),
+)
+.unwrap();
+// `tier` survived, so only what it holds now travels — the receiver keeps the
+// old value it already has. `zone` left, and its key alone says so.
+assert_eq!(delta.labels.add, vec![("tier".to_string(), "edge".to_string())]);
+assert_eq!(delta.labels.remove, vec!["zone".to_string()]);
+```
+
+A key that survived with a new value under it is an *addition*, not a removal followed by one — applying an addition overwrites whatever the key held. Which of the two shapes a field gets is the collection's business: the delta field is declared as `<T as Unordered>::Delta`, and the collection's `Unordered` impl picks, which is what lets one field type cover both.
 
 ### Keyed collections
 
@@ -118,7 +149,7 @@ assert_eq!(delta.services.change[0].delta.port, Some(8080));
 assert_eq!(delta.services.change[0].delta.healthy, None);
 ```
 
-The three parts are deliberately asymmetric: `add` carries whole entries because the receiver has never seen them, while `remove` carries bare keys and `change` carries deltas, because for those the receiver already holds the rest. The field must be a map — applying a change mutates a value where it sits, which is why this needs `TryIndexMut` and a set will not do. Enable the `serde` feature to serialize a delta containing an `unordered-delta` field.
+The three parts are deliberately asymmetric: `add` carries whole entries because the receiver has never seen them, while `remove` carries bare keys and `change` carries deltas, because for those the receiver already holds the rest. That last part is the trade against `unordered` over the same map, which sends a changed value whole but asks nothing of the value type beyond `PartialEq`. The field must be a map — applying a change mutates a value where it sits, which is why this needs `TryIndexMut` and a set will not do. Enable the `serde` feature to serialize a delta containing an `unordered-delta` field.
 
 ### Decorating the generated struct
 
@@ -143,7 +174,7 @@ assert_eq!(payload.as_deref(), Some(r#"{"host":null,"port":8080}"#));
 
 // Receiver applies it to whatever it already had.
 let mut config = Config { host: "localhost".to_string(), port: 80 };
-config.apply_delta(serde_json::from_str::<ConfigDelta>(&payload.unwrap()).unwrap());
+config.apply_delta(serde_json::from_str::<ConfigDelta>(&payload.unwrap()).unwrap()).unwrap();
 assert_eq!(config.port, 8080);
 ```
 
@@ -174,12 +205,61 @@ assert_eq!(
 
 Splice positions index the old sequence and arrive sorted and non-overlapping, so applying one is a single forward pass and reproduces the new sequence exactly. Items need `Hash + Eq`, which is what Myers requires — so a `Vec<f64>` has nowhere to go but `scalar`. Enable the `serde` feature to serialize a delta containing an `ordered` field.
 
+### Enums
+
+An enum changes in two ways a struct cannot, and its delta says which. Same variant on both sides: diffed field by field, like a struct. Different variants: no difference to describe, so the whole value travels.
+
+```rust
+use delta_struct::{Delta, EnumDelta};
+
+#[derive(Delta)]
+#[delta_struct(delta_leader = "#[derive(Debug)]")]
+enum Shape {
+    Empty,
+    Circle { r: u32 },
+}
+
+// Same variant: only the field that moved travels.
+let delta = Delta::delta(Shape::Circle { r: 1 }, Shape::Circle { r: 2 }).unwrap();
+match delta {
+    EnumDelta::Delta(ShapeDelta::Circle { r }) => assert_eq!(r, Some(2)),
+    _ => panic!("same variant"),
+}
+
+// Different variant: a replacement, not a difference.
+let delta = Delta::delta(Shape::Empty, Shape::Circle { r: 3 }).unwrap();
+assert!(matches!(delta, EnumDelta::Became(Shape::Circle { r: 3 })));
+```
+
+So `Output` is `EnumDelta<Self, {Self}Delta>` rather than the bare companion, and the generated enum carries one variant per *diffable* source variant — a field-less variant gets none, since two of those can never differ. Keeping `Became` on a crate type rather than as an arm of the generated enum is what lets you have a variant of your own called `Became`.
+
+This is why `apply_delta` is fallible. A delta built while a value was one variant can arrive at a value that is now another, and that's real divergence:
+
+```rust
+use delta_struct::{Delta, Mismatch};
+
+#[derive(Delta)]
+enum Shape {
+    Empty,
+    Circle { r: u32 },
+}
+
+let delta = Delta::delta(Shape::Circle { r: 1 }, Shape::Circle { r: 2 }).unwrap();
+let mut diverged = Shape::Empty;
+assert_eq!(
+    diverged.apply_delta(delta),
+    Err(Mismatch { type_name: "Shape", expected: "Circle", found: "Empty" }),
+);
+```
+
+Nested deltas propagate the innermost mismatch, so you get the enum that actually disagreed rather than the outermost struct you called `apply_delta` on.
+
 ### Checking that a delta belongs
 
 `apply_delta` assumes the value it is handed equals the `old` the delta came from, and checks nothing — so over a wire, a dropped or duplicated message diverges the two sides in silence. `Versioned` is the opt-in fix:
 
 ```rust
-use delta_struct::{Applied, Delta, Fingerprint, Mismatch, Versioned};
+use delta_struct::{Applied, Delta, Fingerprint, Versioned};
 
 #[derive(Clone, Debug, Delta, Fingerprint, PartialEq)]
 #[delta_struct(delta_leader = "#[derive(Clone)]")]
@@ -217,10 +297,11 @@ None of this touches the `Delta` trait, the derive, or any generated struct. Dif
 
 ### Limitations
 
-- Structs only — enums and unions are rejected.
+- Unions are rejected; structs and enums are both supported.
+- An enum with no variants is rejected — an uninhabited type has no two values that could differ.
 - Applying an `unordered` or `unordered-delta` delta preserves membership, not position; use `ordered` when position matters.
 - `ordered` items must be `Hash + Eq`.
-- A `Vec` cannot be an `unordered` field — use a `HashSet`/`BTreeSet`, or `ordered`.
+- A `Vec` cannot be an `unordered` field — use a `HashSet`/`BTreeSet`/`HashMap`/`BTreeMap`, or `ordered`.
 - `unordered-delta` keys come from the collection, so there is no way to nominate a field of the value as the key.
 - `Versioned` assumes one writer per stream; concurrent writers are detected, not reconciled.
 

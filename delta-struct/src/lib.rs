@@ -10,7 +10,7 @@
 //! # Quick start
 //!
 //! ```
-//! use delta_struct::Delta;
+//! use delta_struct::{Delta, ScalarDelta};
 //!
 //! #[derive(Delta)]
 //! struct Config {
@@ -23,8 +23,8 @@
 //!
 //! // `Config` gained a companion struct named `ConfigDelta`.
 //! let delta = Delta::delta(old, new).expect("the port changed");
-//! assert_eq!(delta.host, None);          // unchanged fields are `None`
-//! assert_eq!(delta.port, Some(8080));
+//! assert_eq!(delta.host, ScalarDelta::Unchanged);
+//! assert_eq!(delta.port, ScalarDelta::Changed(8080));
 //!
 //! // Applying the delta to an older copy brings it up to date.
 //! let mut current = Config { host: "localhost".to_string(), port: 80 };
@@ -53,8 +53,8 @@
 //! ## `scalar` (the default)
 //!
 //! The field is compared with `!=` and replaced wholesale. In the delta struct
-//! it becomes `Option<T>`: `Some(new_value)` when the two differ, [`None`]
-//! when they don't. Requires `T: PartialEq`.
+//! it becomes [`ScalarDelta<T>`]: `ScalarDelta::Changed(new_value)` when
+//! the two differ, `ScalarDelta::Unchanged` when they don't. Requires `T: PartialEq`.
 //!
 //! ## `unordered`
 //!
@@ -159,7 +159,7 @@
 //! [`MapDelta`], holding an `add`, a `remove`, and a `change`.
 //!
 //! ```
-//! use delta_struct::Delta;
+//! use delta_struct::{Delta, ScalarDelta};
 //! use std::collections::HashMap;
 //!
 //! #[derive(Delta)]
@@ -185,8 +185,8 @@
 //! assert!(delta.services.add.is_empty());
 //! assert!(delta.services.remove.is_empty());
 //! assert_eq!(delta.services.change[0].key, "web");
-//! assert_eq!(delta.services.change[0].delta.port, Some(8080));
-//! assert_eq!(delta.services.change[0].delta.healthy, None);
+//! assert_eq!(delta.services.change[0].delta.port, ScalarDelta::Changed(8080));
+//! assert_eq!(delta.services.change[0].delta.healthy, ScalarDelta::Unchanged);
 //! ```
 //!
 //! The key is the collection's own — the `K` of a `HashMap<K, V>` — not
@@ -250,7 +250,7 @@
 //! [`Delta`]; the delta struct holds `Option<<T as Delta>::Output>`.
 //!
 //! ```
-//! use delta_struct::Delta;
+//! use delta_struct::{Delta, ScalarDelta};
 //!
 //! #[derive(Delta)]
 //! struct Inner {
@@ -270,8 +270,8 @@
 //!
 //! let delta = Delta::delta(old, new).unwrap();
 //! let inner_delta = delta.inner.expect("`b` changed");
-//! assert_eq!(inner_delta.a, None);
-//! assert_eq!(inner_delta.b, Some(3));
+//! assert_eq!(inner_delta.a, ScalarDelta::Unchanged);
+//! assert_eq!(inner_delta.b, ScalarDelta::Changed(3));
 //! ```
 //!
 //! # Enums
@@ -288,7 +288,7 @@
 //! a field-less variant gets none, since two of those can never differ.
 //!
 //! ```
-//! use delta_struct::{Delta, EnumDelta};
+//! use delta_struct::{Delta, EnumDelta, ScalarDelta};
 //!
 //! #[derive(Delta)]
 //! #[delta_struct(delta_leader = "#[derive(Debug)]")]
@@ -300,7 +300,7 @@
 //! // Same variant: only the field that moved travels.
 //! let delta = Delta::delta(Shape::Circle { r: 1 }, Shape::Circle { r: 2 }).unwrap();
 //! match delta {
-//!     EnumDelta::Delta(ShapeDelta::Circle { r }) => assert_eq!(r, Some(2)),
+//!     EnumDelta::Delta(ShapeDelta::Circle { r }) => assert_eq!(r, ScalarDelta::Changed(2)),
 //!     _ => panic!("same variant"),
 //! }
 //!
@@ -350,7 +350,7 @@
 //!   attribute to a type you never get to write by hand.
 //!
 //! ```
-//! use delta_struct::Delta;
+//! use delta_struct::{Delta, ScalarDelta};
 //! use std::collections::HashSet;
 //!
 //! #[derive(Delta)]
@@ -372,7 +372,7 @@
 //! };
 //! let delta = Delta::delta(old, new).unwrap();
 //! assert_eq!(format!("{:?}", delta.labels.add), r#"["new"]"#);
-//! assert_eq!(delta.revision, Some(2));
+//! assert_eq!(delta.revision, ScalarDelta::Changed(2));
 //! ```
 //!
 //! `delta_leader` also works on individual fields, where it decorates the
@@ -408,7 +408,7 @@
 //!
 //! // Sender: there is no message to send at all when nothing changed.
 //! let payload = Delta::delta(old, new).map(|delta| serde_json::to_string(&delta).unwrap());
-//! assert_eq!(payload.as_deref(), Some(r#"{"host":null,"port":8080}"#));
+//! assert_eq!(payload.as_deref(), Some(r#"{"host":"unchanged","port":{"changed":8080}}"#));
 //!
 //! // Receiver applies it to whatever it already had.
 //! let mut config = Config { host: "localhost".to_string(), port: 80 };
@@ -426,9 +426,9 @@
 //! #[derive(Delta)]
 //! #[delta_struct(delta_leader = "#[derive(serde::Serialize)]")]
 //! struct Config {
-//!     #[delta_struct(delta_leader = "#[serde(skip_serializing_if = \"Option::is_none\")]")]
+//!     #[delta_struct(delta_leader = "#[serde(default, skip_serializing_if = \"::delta_struct::ScalarDelta::is_unchanged\")]")]
 //!     host: String,
-//!     #[delta_struct(delta_leader = "#[serde(skip_serializing_if = \"Option::is_none\")]")]
+//!     #[delta_struct(delta_leader = "#[serde(default, skip_serializing_if = \"::delta_struct::ScalarDelta::is_unchanged\")]")]
 //!     port: u16,
 //! }
 //!
@@ -436,7 +436,7 @@
 //! let new = Config { host: "localhost".to_string(), port: 8080 };
 //!
 //! let delta = Delta::delta(old, new).unwrap();
-//! assert_eq!(serde_json::to_string(&delta).unwrap(), r#"{"port":8080}"#);
+//! assert_eq!(serde_json::to_string(&delta).unwrap(), r#"{"port":{"changed":8080}}"#);
 //! ```
 //!
 //! # Checking that a delta belongs
@@ -534,13 +534,13 @@
 //! struct in turn, so its fields keep their positions:
 //!
 //! ```
-//! use delta_struct::Delta;
+//! use delta_struct::{Delta, ScalarDelta};
 //!
 //! #[derive(Delta)]
 //! struct Meters(i32);
 //!
 //! let delta = Delta::delta(Meters(3), Meters(4)).unwrap();
-//! assert_eq!(delta.0, Some(4));
+//! assert_eq!(delta.0, ScalarDelta::Changed(4));
 //! ```
 //!
 //! # Limitations
@@ -576,6 +576,10 @@
 // `ordered` field needs. That path has to resolve inside this crate too, or
 // the crate's own tests could not use its own derive.
 extern crate self as delta_struct;
+
+#[cfg(doctest)]
+#[doc = include_str!("../../README.md")]
+struct ReadmeDoctests;
 
 pub mod bag;
 pub mod entry;
@@ -636,6 +640,60 @@ pub trait Delta {
     /// replacing wholesale, not patching again.
     fn apply_delta(&mut self, delta: Self::Output) -> Result<(), Mismatch>;
 }
+
+/// This type exists as a workaround for the `serde` data model being unable to distinguish
+/// between `Some(None)` and `None` in serialized bytes. It is, in nearly every respect,
+/// [`Option<T>`], just with some more semantic clarity. You may freely convert between this
+/// and [`Option<T>`] using [`From::from`] or [`Into::into`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, PartialOrd, Ord, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(rename_all = "lowercase")
+)]
+pub enum ScalarDelta<T> {
+    /// The value was not altered, use the old value.
+    #[default]
+    Unchanged,
+    /// The value was altered, here is the new value.
+    Changed(T),
+}
+
+impl<T> ScalarDelta<T> {
+    /// Convenient shorthand for converting to `Option`.
+    pub fn opt(self) -> Option<T> {
+        self.into()
+    }
+
+    /// Returns true if this contains no change.
+    pub fn is_unchanged(&self) -> bool {
+        matches!(self, Self::Unchanged)
+    }
+
+    /// Returns true if this contains a change.
+    pub fn is_changed(&self) -> bool {
+        matches!(self, Self::Changed(_))
+    }
+}
+
+impl<T> From<Option<T>> for ScalarDelta<T> {
+    fn from(value: Option<T>) -> Self {
+        match value {
+            Some(v) => Self::Changed(v),
+            None => Self::Unchanged,
+        }
+    }
+}
+
+impl<T> From<ScalarDelta<T>> for Option<T> {
+    fn from(value: ScalarDelta<T>) -> Self {
+        match value {
+            ScalarDelta::Changed(v) => Some(v),
+            ScalarDelta::Unchanged => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -700,8 +758,8 @@ mod tests {
                 insert: vec!["b".to_string()],
             }]
         );
-        assert_eq!(delta.2, Some(NewTypeDelta(Some(8))));
-        assert_eq!(delta.3, Some(true));
+        assert_eq!(delta.2, Some(NewTypeDelta(ScalarDelta::Changed(8))));
+        assert_eq!(delta.3, ScalarDelta::Changed(true));
 
         let mut applied = old;
         applied.apply_delta(delta).unwrap();
@@ -716,7 +774,10 @@ mod tests {
         struct Meters(i32, i32);
 
         let delta = Delta::delta(Meters(1, 2), Meters(1, 3)).unwrap();
-        assert_eq!(serde_json::to_string(&delta).unwrap(), "[null,3]");
+        assert_eq!(
+            serde_json::to_string(&delta).unwrap(),
+            "[\"unchanged\",{\"changed\":3}]"
+        );
     }
 
     #[derive(Delta)]
@@ -827,7 +888,7 @@ mod tests {
         let delta = Delta::delta(old, new).unwrap();
         assert_eq!(delta.foo.add, vec![4, 5]);
         assert_eq!(delta.foo.remove, vec![1, 2]);
-        assert_eq!(delta.bar, Some(true));
+        assert_eq!(delta.bar, ScalarDelta::Changed(true));
     }
 
     #[test]
@@ -915,8 +976,8 @@ mod tests {
         let old = SimpleType { foo: 5, bar: false };
         let new = SimpleType { foo: 5, bar: true };
         let delta = Delta::delta(old, new).unwrap();
-        assert!(delta.foo.is_none());
-        assert_eq!(delta.bar, Some(true));
+        assert!(delta.foo.is_unchanged());
+        assert_eq!(delta.bar, ScalarDelta::Changed(true));
     }
 
     #[test]
@@ -930,8 +991,8 @@ mod tests {
             bar: true,
         };
         let delta = Delta::delta(old, new).unwrap();
-        assert_eq!(delta.foo, Some(NewTypeDelta(Some(6))));
-        assert_eq!(delta.bar, Some(true));
+        assert_eq!(delta.foo, Some(NewTypeDelta(ScalarDelta::Changed(6))));
+        assert_eq!(delta.bar, ScalarDelta::Changed(true));
     }
 
     #[test]
@@ -947,8 +1008,8 @@ mod tests {
             baz: vec![9, 4, 5].into_iter().collect(),
         };
         let delta = Delta::delta(old, new).unwrap();
-        assert!(delta.foo.is_none());
-        assert!(delta.bar.is_none());
+        assert!(delta.foo.is_unchanged());
+        assert!(delta.bar.is_unchanged());
         assert_eq!(delta.baz.add, vec![4, 5, 9]);
         assert_eq!(delta.baz.remove, Vec::<i32>::new());
     }
@@ -989,7 +1050,7 @@ mod tests {
                 insert: vec!["x".to_string()],
             }]
         );
-        assert_eq!(delta.shuffle, None);
+        assert_eq!(delta.shuffle, ScalarDelta::Unchanged);
     }
 
     #[test]
@@ -1137,9 +1198,15 @@ mod tests {
         assert!(delta.services.remove.is_empty());
         assert_eq!(delta.services.change.len(), 1);
         assert_eq!(delta.services.change[0].key, "web");
-        assert_eq!(delta.services.change[0].delta.port, Some(8080));
-        assert_eq!(delta.services.change[0].delta.healthy, None);
-        assert_eq!(delta.region, None);
+        assert_eq!(
+            delta.services.change[0].delta.port,
+            ScalarDelta::Changed(8080)
+        );
+        assert_eq!(
+            delta.services.change[0].delta.healthy,
+            ScalarDelta::Unchanged
+        );
+        assert_eq!(delta.region, ScalarDelta::Unchanged);
     }
 
     #[test]
@@ -1259,7 +1326,7 @@ mod tests {
         );
         assert!(delta.services.remove.is_empty());
         // `db` sat still on both sides, and so did the region.
-        assert_eq!(delta.region, None);
+        assert_eq!(delta.region, ScalarDelta::Unchanged);
     }
 
     #[test]
@@ -1439,7 +1506,7 @@ mod tests {
         let delta = Delta::delta(fleet(80), fleet(8080)).unwrap();
         assert_eq!(
             serde_json::to_string(&delta).unwrap(),
-            r#"{"services":{"add":[],"remove":[],"change":[{"key":"web","delta":{"port":8080,"healthy":null}}]}}"#
+            r#"{"services":{"add":[],"remove":[],"change":[{"key":"web","delta":{"port":{"changed":8080},"healthy":"unchanged"}}]}}"#
         );
     }
 
@@ -1673,8 +1740,8 @@ mod tests {
         let delta = Delta::delta(rect(1, 2, &["a"]), rect(1, 3, &["a", "b"])).unwrap();
         match delta {
             EnumDelta::Delta(ShapeDelta::Rect { w, h, tags }) => {
-                assert_eq!(w, None); // unchanged, so it does not travel
-                assert_eq!(h, Some(3));
+                assert_eq!(w, ScalarDelta::Unchanged); // unchanged, so it does not travel
+                assert_eq!(h, ScalarDelta::Changed(3));
                 assert_eq!(tags.add, vec!["b".to_string()]);
                 assert!(tags.remove.is_empty());
             }
@@ -1796,7 +1863,10 @@ mod tests {
         }
 
         let delta = Delta::delta(Slot::Filled(1), Slot::Filled(2)).unwrap();
-        assert_eq!(delta, EnumDelta::Delta(SlotDelta::Filled(Some(2))));
+        assert_eq!(
+            delta,
+            EnumDelta::Delta(SlotDelta::Filled(ScalarDelta::Changed(2)))
+        );
 
         let mut applied = Slot::Filled(1);
         applied.apply_delta(delta).unwrap();
@@ -1809,7 +1879,7 @@ mod tests {
         let delta = Delta::delta(Shape::Circle(1), Shape::Circle(2)).unwrap();
         assert_eq!(
             serde_json::to_string(&delta).unwrap(),
-            r#"{"Delta":{"Circle":2}}"#
+            r#"{"Delta":{"Circle":{"changed":2}}}"#
         );
         // `Became` carries the source enum whole, which is why serializing an
         // enum's delta needs the enum itself to be serializable.
@@ -1847,16 +1917,16 @@ mod tests {
             InlineBoundGeneric { foo: 2, bar: false },
         )
         .unwrap();
-        assert_eq!(delta.foo, Some(2));
-        assert_eq!(delta.bar, None);
+        assert_eq!(delta.foo, ScalarDelta::Changed(2));
+        assert_eq!(delta.bar, ScalarDelta::Unchanged);
 
         let delta = Delta::delta(
             WhereClauseGeneric { foo: 1, bar: false },
             WhereClauseGeneric { foo: 2, bar: false },
         )
         .unwrap();
-        assert_eq!(delta.foo, Some(2));
-        assert_eq!(delta.bar, None);
+        assert_eq!(delta.foo, ScalarDelta::Changed(2));
+        assert_eq!(delta.bar, ScalarDelta::Unchanged);
     }
 
     #[test]
@@ -1866,7 +1936,7 @@ mod tests {
             InlineBoundDeltaField { foo: NewType(2) },
         )
         .unwrap();
-        assert_eq!(delta.foo.unwrap().0, Some(2));
+        assert_eq!(delta.foo.unwrap().0, ScalarDelta::Changed(2));
 
         let mut applied = WhereClauseDeltaField { foo: NewType(1) };
         let delta = Delta::delta(

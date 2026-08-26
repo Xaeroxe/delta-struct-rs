@@ -117,7 +117,7 @@ pub struct KeyedDelta<K, D> {
 /// a [`BTreeMap`](std::collections::BTreeMap).
 ///
 /// ```
-/// use delta_struct::{map, Delta};
+/// use delta_struct::{map, Delta, ScalarDelta};
 /// use std::collections::BTreeMap;
 ///
 /// #[derive(Delta)]
@@ -136,8 +136,8 @@ pub struct KeyedDelta<K, D> {
 /// let delta = map::diff(services(80), services(8080));
 /// assert!(delta.add.is_empty() && delta.remove.is_empty());
 /// assert_eq!(delta.change[0].key, "web");
-/// assert_eq!(delta.change[0].delta.port, Some(8080));
-/// assert_eq!(delta.change[0].delta.healthy, None);
+/// assert_eq!(delta.change[0].delta.port, ScalarDelta::Changed(8080));
+/// assert_eq!(delta.change[0].delta.healthy, ScalarDelta::Unchanged);
 /// ```
 pub fn diff<C, E>(old: C, mut new: C) -> MapDelta<E::Key, E::Value, <E::Value as Delta>::Output>
 where

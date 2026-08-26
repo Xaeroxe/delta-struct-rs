@@ -92,7 +92,7 @@ type ParsedAttrs = Result<(Option<FieldType>, String), FieldTypeError>;
 ///
 /// | Value | Delta representation | Requires |
 /// | --- | --- | --- |
-/// | `"scalar"` | `Option<T>` | `T: PartialEq` |
+/// | `"scalar"` | `delta_struct::ScalarDelta<T>` | `T: PartialEq` |
 /// | `"unordered"` | `<T as Unordered>::Delta` — `BagDelta<Item>` for a set, `EntryDelta<Key, Value>` for a map | `T: Unordered` |
 /// | `"unordered-delta"` | `MapDelta<Key, Value, <Value as Delta>::Output>`, an `add`, a `remove`, and a `change` | `T: IntoIterator + Extend<Item> + TryIndexMut<Key, Output = Value> Item: MapEntry` (so `(K, V)`), `Value: Delta` |
 /// | `"ordered"` | `SeqDelta<Item>`, a Myers edit script | `T: IntoIterator + FromIterator<Item>`, `Item: Hash + Eq` |
@@ -596,7 +596,7 @@ fn delta_fields_inner(
                 let value = quote!(<#entry as ::delta_struct::MapEntry>::Value);
                 quote!(::delta_struct::MapDelta<#key, #value, <#value as Delta>::Output>)
             }
-            FieldType::Scalar => quote!(::std::option::Option<#ty>),
+            FieldType::Scalar => quote!(::delta_struct::ScalarDelta<#ty>),
             FieldType::Delta => quote!(::std::option::Option<<#ty as Delta>::Output>),
         };
         if named {
@@ -652,9 +652,9 @@ fn delta_compute_fields(
             FieldType::Scalar => quote! {
                 let #ident = if #old != #new {
                     delta_is_some = true;
-                    Some(#new)
+                    ::delta_struct::ScalarDelta::Changed(#new)
                 } else {
-                    None
+                    ::delta_struct::ScalarDelta::Unchanged
                 };
             },
             FieldType::Delta => quote! {
@@ -698,7 +698,7 @@ fn delta_apply_fields(
                 <#ty as ::delta_struct::Unordered>::apply(&mut #target, #ident);
             },
             FieldType::Scalar => quote! {
-                if let Some(v) = #ident {
+                if let ::delta_struct::ScalarDelta::Changed(v) = #ident {
                     #target = v;
                 }
             },

@@ -11,11 +11,15 @@ use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as TokenStream2, TokenTree};
 use proc_macro_error::{abort_call_site, proc_macro_error};
 use quote::{format_ident, quote, ToTokens};
-use std::{iter::FromIterator, str::FromStr};
+use std::{
+    fmt::{self, Display},
+    iter::FromIterator,
+    str::FromStr,
+};
 use syn::{
-    parse_macro_input, punctuated::Punctuated, Attribute, Data, DeriveInput, Fields, Ident, Lit,
-    Meta, MetaList, MetaNameValue, NestedMeta, Path, PredicateType, Token, TraitBound,
-    TraitBoundModifier, Type, TypeParamBound, WherePredicate,
+    parse_macro_input, punctuated::Punctuated, Attribute, Data, DeriveInput, Expr, ExprLit, Fields,
+    Ident, Lit, Meta, MetaList, MetaNameValue, Path, PredicateType, Token, TraitBound,
+    TraitBoundModifiers, Type, TypeParamBound, WherePredicate,
 };
 
 /// How a single field is diffed, and therefore how it is represented on the
@@ -124,11 +128,12 @@ pub fn derive_delta(input: TokenStream) -> TokenStream {
     let (default_field_type, delta_leader) =
         match get_fieldtype_from_attrs(attrs.into_iter(), "default") {
             Ok((v, delta_leader)) => (v.unwrap_or(FieldType::Scalar), delta_leader),
-            Err(_) => {
+            Err(e) => {
                 abort_call_site!(
-                    "delta_struct(default = ...) for {} is not an accepted value, expected {}.",
+                    "delta_struct(default = ...) for {} is not an accepted value, expected {}. {}",
                     ident,
-                    VALID_FIELD_TYPES
+                    VALID_FIELD_TYPES,
+                    e,
                 );
             }
         };
@@ -200,8 +205,9 @@ pub fn derive_delta(input: TokenStream) -> TokenStream {
         segments.push(Ident::new("PartialEq", Span::call_site()).into());
         bounds.push(TypeParamBound::Trait(TraitBound {
             paren_token: None,
-            modifier: TraitBoundModifier::None,
+            modifiers: TraitBoundModifiers::default(),
             lifetimes: None,
+            maybe: None,
             path: Path {
                 leading_colon: Some(Token!(::)(Span::call_site())),
                 segments,
@@ -210,6 +216,7 @@ pub fn derive_delta(input: TokenStream) -> TokenStream {
         where_clause
             .predicates
             .push(WherePredicate::Type(PredicateType {
+                attrs: Vec::new(),
                 lifetimes: None,
                 bounded_ty: Type::Verbatim(<Ident as Into<TokenTree>>::into(ty).into()),
                 colon_token: Token!(:)(Span::call_site()),
@@ -818,9 +825,35 @@ fn collect_results(
 }
 
 enum FieldTypeError {
+    Syn(syn::Error),
     /// The `delta_struct(...)` attribute contained entries that were not
     /// `name = "value"` pairs.
-    UnrecognizedJunkFound,
+    UnrecognizedJunkFound(Vec<Meta>),
+}
+
+impl From<syn::Error> for FieldTypeError {
+    fn from(value: syn::Error) -> Self {
+        FieldTypeError::Syn(value)
+    }
+}
+
+impl Display for FieldTypeError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            FieldTypeError::Syn(error) => write!(f, "{error}"),
+            FieldTypeError::UnrecognizedJunkFound(metas) => {
+                let metas = metas
+                    .iter()
+                    .map(|m| m.into_token_stream().to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                write!(
+                    f,
+                    "expected a comma separated list of named values, got {metas}"
+                )
+            }
+        }
+    }
 }
 
 /// Reads a `#[delta_struct(...)]` attribute, returning
@@ -834,21 +867,26 @@ enum FieldTypeError {
 #[allow(clippy::manual_try_fold)] // Collects errors too
 fn get_fieldtype_from_attrs(iter: impl Iterator<Item = Attribute>, attr_name: &str) -> ParsedAttrs {
     for attr in iter {
-        if let Ok(Meta::List(MetaList { path, nested, .. })) = attr.parse_meta() {
+        if let Meta::List(MetaList { path, .. }) = &attr.meta {
             let Path { segments, .. } = path;
             if segments
                 .iter()
                 .map(|p| &p.ident)
                 .eq(["delta_struct"].iter().cloned())
             {
-                let values: Result<Vec<_>, Vec<NestedMeta>> = nested
+                let nested =
+                    attr.parse_args_with(Punctuated::<Meta, Token!(,)>::parse_terminated)?;
+                let values: Result<Vec<_>, Vec<Meta>> = nested
                     .iter()
-                    .map(|nested_meta| match nested_meta {
-                        NestedMeta::Meta(Meta::NameValue(MetaNameValue {
+                    .map(|meta| match meta {
+                        Meta::NameValue(MetaNameValue {
                             path,
-                            lit: Lit::Str(s),
+                            value:
+                                Expr::Lit(ExprLit {
+                                    lit: Lit::Str(s), ..
+                                }),
                             ..
-                        })) => Ok((path.get_ident().map(|i| i.to_string()), s.value())),
+                        }) => Ok((path.get_ident().map(|i| i.to_string()), s.value())),
                         e => Err(e),
                     })
                     .fold(Ok(vec![]), |v, i| match (v, i) {
@@ -863,27 +901,23 @@ fn get_fieldtype_from_attrs(iter: impl Iterator<Item = Attribute>, attr_name: &s
                         }
                         (v @ Err(_), _) => v,
                     });
-                return match values {
-                    Ok(v) => {
-                        let mut field_type = None;
-                        let mut delta_leader = String::new();
-                        for i in v {
-                            match i.0.as_deref() {
-                                Some("delta_leader") => {
-                                    delta_leader = i.1;
-                                }
-                                a if Some(attr_name) == a => {
-                                    field_type = string_to_fieldtype(&i.1);
-                                }
-                                a => {
-                                    abort_call_site!("Unrecognized value {:?}", a);
-                                }
-                            }
+                let v = values.map_err(FieldTypeError::UnrecognizedJunkFound)?;
+                let mut field_type = None;
+                let mut delta_leader = String::new();
+                for i in v {
+                    match i.0.as_deref() {
+                        Some("delta_leader") => {
+                            delta_leader = i.1;
                         }
-                        Ok((field_type, delta_leader))
+                        a if Some(attr_name) == a => {
+                            field_type = string_to_fieldtype(&i.1);
+                        }
+                        a => {
+                            abort_call_site!("Unrecognized value {:?}", a);
+                        }
                     }
-                    Err(_) => Err(FieldTypeError::UnrecognizedJunkFound),
-                };
+                }
+                return Ok((field_type, delta_leader));
             }
         }
     }
